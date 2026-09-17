@@ -24,6 +24,9 @@ Examples
     DETECTOR=yolo DATASET=bdd bash mount_data.sh
     python run.py --root /content/spk --detector yolo --dataset bdd --max-images 200 --epochs 6
     python run.py --root /content/spk --detector yolo --dataset bdd --splits near_ood far_ood --force --extract-only
+    # After mount_data.sh copied roi/native_knn/concept_head_ood, this skips
+    # extract and head training; it only builds gt.json if missing, then eval.
+    python run.py --root /content/spk --detector yolo --dataset bdd
 
     DETECTOR=frcnn DATASET=voc bash mount_data.sh
     python run.py --root /content/spk --detector frcnn --dataset voc
@@ -2053,11 +2056,13 @@ def train_and_eval(args: argparse.Namespace) -> None:
 
         print(f"  {len(class_names)} class(es) on {args.device}")
         heads = {}
+        n_reused = 0
         for class_name in class_names:
             head_path = args.out / f"{class_name}_head.pt"
             if head_path.is_file() and not args.retrain:
                 head, concept_order = load_saved_head(head_path, args.device)
                 heads[class_name] = (head, concept_order)
+                n_reused += 1
                 print(f"  [{class_name}] reused {head_path.name} ({len(concept_order)} concepts)", flush=True)
                 continue
             x, y, concept_order, groups = build_class_data(training_data, class_name)
@@ -2067,6 +2072,7 @@ def train_and_eval(args: argparse.Namespace) -> None:
             torch.save({"state_dict": head.state_dict(), "concept_order": concept_order,
                         "class_name": class_name}, head_path)
             del x, y
+        print(f"  heads: reused {n_reused}/{len(class_names)}, trained {len(class_names) - n_reused}", flush=True)
         del training_data
 
         print("  scoring cached ROIs")
@@ -2151,6 +2157,73 @@ def train_and_eval(args: argparse.Namespace) -> None:
     (args.out / "results.json").write_text(json.dumps(report, indent=2) + "\n")
     print(f"wrote {args.out}/results.json and {args.out}/activations.csv")
     return report
+
+
+def _planned_classes(args: argparse.Namespace) -> list[str]:
+    if args.classes:
+        return list(args.classes)
+    return list(PROFILE.label_classes)
+
+
+def print_skip_plan(args: argparse.Namespace) -> None:
+    """Say which stages will run vs reuse files already under --root."""
+    classes = _planned_classes(args)
+    heads_ok = [c for c in classes if (args.out / f"{c}_head.pt").is_file()]
+    heads_miss = [c for c in classes if c not in heads_ok]
+    activations_path = args.out / "activations.csv"
+    print("=== skip plan (--force / --retrain / --rescore to override) ===", flush=True)
+    print(
+        f"  A  GT index           {'skip' if GT_INDEX.is_file() else 'run   (no gt.json yet)'}",
+        flush=True,
+    )
+    b_run = False
+    b_bits: list[str] = []
+    for split in args.splits:
+        need_roi, need_native, need_prior = split_needs_extract(split, args)
+        path = ROI_DIR / SPLIT_OUTPUT_NAMES[split]
+        if need_roi or need_native or need_prior:
+            b_run = True
+            why = []
+            if need_roi:
+                why.append("roi")
+            if need_native:
+                why.append("native")
+            if need_prior:
+                why.append("prior")
+            b_bits.append(f"{split}:{'+'.join(why)}")
+            continue
+        stats = roi_cache_counts(path) if path.is_file() else {"status": "missing"}
+        b_bits.append(
+            f"{split}:skip({stats.get('num_images')} img, {stats.get('num_detections')} det)"
+        )
+    if b_run:
+        print(f"  B  ROI extraction     run   ({'; '.join(b_bits)})", flush=True)
+    else:
+        print(f"  B  ROI extraction     skip  ({'; '.join(b_bits)})", flush=True)
+    native_miss = [split for split in SPLITS if not native_ready(native_split_dir(split))]
+    if native_miss:
+        print(f"  C  native embeddings  run   (missing {native_miss})", flush=True)
+    else:
+        print("  C  native embeddings  skip  (chunks on disk)", flush=True)
+    if args.retrain:
+        print(f"  C  concept heads      run   (retrain {len(classes)} classes)", flush=True)
+    elif heads_miss:
+        print(
+            f"  C  concept heads      run   (train {heads_miss}; reuse {heads_ok or 'none'})",
+            flush=True,
+        )
+    else:
+        print(
+            f"  C  concept heads      skip  ({len(heads_ok)}/{len(classes)} *_head.pt)",
+            flush=True,
+        )
+    if args.rescore or args.retrain:
+        print("  C  ROI scoring        run", flush=True)
+    elif activations_path.is_file():
+        print(f"  C  ROI scoring        skip  ({activations_path.name} exists)", flush=True)
+    else:
+        print("  C  ROI scoring        run   (no activations.csv; heads reused if present)", flush=True)
+    print("  C  FPR95 eval         run", flush=True)
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -2242,6 +2315,7 @@ def main() -> None:
         f"vram_frac={args.vram_frac:.0%}",
         flush=True,
     )
+    print_skip_plan(args)
     t_all = time.perf_counter()
     timings: dict[str, float] = {}
 
