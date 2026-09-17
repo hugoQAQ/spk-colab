@@ -23,6 +23,7 @@ Examples
 
     DETECTOR=yolo DATASET=bdd bash mount_data.sh
     python run.py --root /content/spk --detector yolo --dataset bdd --max-images 200 --epochs 6
+    python run.py --root /content/spk --detector yolo --dataset bdd --splits near_ood far_ood --force --extract-only
 
     DETECTOR=frcnn DATASET=voc bash mount_data.sh
     python run.py --root /content/spk --detector frcnn --dataset voc
@@ -35,8 +36,10 @@ import argparse
 import csv
 import io
 import json
+import pickle
 import tarfile
 import time
+import zipfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterator
@@ -1143,6 +1146,129 @@ def native_ready(native_dir: Path) -> bool:
     return chunk_dir.is_dir() and any(chunk_dir.glob("chunk_*.pt"))
 
 
+def _unpickle_torch_header(path: Path) -> dict[str, Any] | None:
+    """Load the pickle dict from a torch.save zip, dropping tensor payloads."""
+
+    class _Drop:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __setstate__(self, state):
+            pass
+
+        def __call__(self, *args, **kwargs):
+            return _Drop()
+
+    class _Unpickler(pickle.Unpickler):
+        def persistent_load(self, pid):
+            return _Drop()
+
+        def find_class(self, module, name):
+            if module.startswith("torch") or module.startswith("numpy"):
+                return _Drop
+            return super().find_class(module, name)
+
+    try:
+        with zipfile.ZipFile(path) as zf:
+            name = next((n for n in zf.namelist() if n.endswith("data.pkl")), None)
+            if name is None:
+                return None
+            with zf.open(name) as fh:
+                obj = _Unpickler(fh).load()
+        return obj if isinstance(obj, dict) else None
+    except (zipfile.BadZipFile, pickle.UnpicklingError, OSError, EOFError, StopIteration):
+        return None
+
+
+def roi_cache_counts(path: Path) -> dict[str, Any]:
+    """Read num_images / num_detections without materializing ROI tensors."""
+    info: dict[str, Any] = {"output": str(path.resolve()), "status": "existing"}
+    if not path.is_file():
+        info["status"] = "missing"
+        return info
+    header = _unpickle_torch_header(path)
+    if header is not None:
+        if header.get("num_detections") is not None:
+            info["num_detections"] = int(header["num_detections"])
+        if header.get("num_images") is not None:
+            info["num_images"] = int(header["num_images"])
+        if "num_detections" in info and "num_images" in info:
+            return info
+        meta = header.get("metadata")
+        if "num_detections" not in info and isinstance(meta, list):
+            info["num_detections"] = len(meta)
+        if "num_images" in info and "num_detections" in info:
+            return info
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    info["num_detections"] = int(payload["num_detections"])
+    info["num_images"] = int(payload["num_images"])
+    return info
+
+
+def write_extraction_summary(summaries: list[dict[str, Any]], elapsed_sec: float) -> Path:
+    """Write extraction_summary.json, keeping counts for splits not in this run."""
+    path = ROI_DIR / "extraction_summary.json"
+    by_split: dict[str, dict[str, Any]] = {}
+    if path.is_file():
+        try:
+            previous = json.loads(path.read_text())
+            for item in previous.get("splits", []):
+                name = item.get("split")
+                if name:
+                    by_split[name] = item
+        except (json.JSONDecodeError, OSError):
+            pass
+    for item in summaries:
+        by_split[item["split"]] = item
+    ordered: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for split in SPLITS:
+        cache = ROI_DIR / SPLIT_OUTPUT_NAMES[split]
+        if split in by_split:
+            item = by_split[split]
+            roi = dict(item.get("roi") or {})
+            if roi.get("num_detections") is None or item.get("num_images") is None:
+                stats = roi_cache_counts(cache)
+                roi = {**stats, **roi}
+                item = {
+                    **item,
+                    "num_images": (
+                        item.get("num_images")
+                        if item.get("num_images") is not None
+                        else stats.get("num_images")
+                    ),
+                    "roi": roi,
+                }
+            ordered.append(item)
+        else:
+            stats = roi_cache_counts(cache)
+            ordered.append({
+                "split": split,
+                "num_images": stats.get("num_images"),
+                "roi": {**stats, "status": stats.get("status", "existing")},
+            })
+        seen.add(split)
+    for split, item in by_split.items():
+        if split not in seen:
+            ordered.append(item)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "detector": PROFILE.detector,
+                "dataset": PROFILE.name,
+                "checkpoint": str(CHECKPOINT.resolve()),
+                "max_det": PROFILE.max_det,
+                "splits": ordered,
+                "elapsed_sec": elapsed_sec,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    return path
+
+
 def split_needs_extract(split: str, args: argparse.Namespace) -> tuple[bool, bool, bool]:
     """Return (need_roi, need_native, need_prior) for this split."""
     roi_path = ROI_DIR / SPLIT_OUTPUT_NAMES[split]
@@ -1162,8 +1288,18 @@ def extract_split(split: str, engine, args: argparse.Namespace) -> dict[str, Any
     native_dir = native_split_dir(split)
     need_roi, need_native, need_prior = split_needs_extract(split, args)
     if not need_roi and not need_native and not need_prior:
-        print(f"  {split}: caches exist, skipping (use --force to redo ROI)")
-        return {"split": split, "roi": {"status": "skipped_existing"}}
+        stats = roi_cache_counts(roi_path)
+        print(
+            f"  {split}: caches exist, skipping "
+            f"(images={stats.get('num_images')} dets={stats.get('num_detections')}; "
+            f"use --force to redo ROI)",
+            flush=True,
+        )
+        return {
+            "split": split,
+            "num_images": stats.get("num_images"),
+            "roi": {**stats, "status": "skipped_existing"},
+        }
 
     t0 = time.perf_counter()
     roi_rows: list[dict[str, Any]] = []
@@ -2048,6 +2184,8 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=None,
                         help="Stage C output dir (default: <root>/data/concept_head_ood)")
     parser.add_argument("--force", action="store_true", help="Re-extract ROI caches that already exist")
+    parser.add_argument("--extract-only", action="store_true",
+                        help="Stop after stage B (ROI extraction); skip concept-head training")
     parser.add_argument("--with-native", action="store_true",
                         help="Also write native-kNN image embeddings (needed for `spk global` / `spk full`)")
     parser.add_argument("--with-prior", action="store_true",
@@ -2131,21 +2269,17 @@ def main() -> None:
         summaries.append(extract_split(split, engine, args))
     del engine
     timings["B_roi_extract"] = time.perf_counter() - t0
-    (ROI_DIR / "extraction_summary.json").write_text(
-        json.dumps(
-            {
-                "detector": PROFILE.detector,
-                "dataset": PROFILE.name,
-                "checkpoint": str(CHECKPOINT.resolve()),
-                "max_det": PROFILE.max_det,
-                "splits": summaries,
-                "elapsed_sec": timings["B_roi_extract"],
-            },
-            indent=2,
-        )
-        + "\n"
-    )
+    summary_path = write_extraction_summary(summaries, timings["B_roi_extract"])
+    print(f"  wrote {summary_path}")
     print(f"  stage B wall {_fmt_duration(timings['B_roi_extract'])}")
+
+    if args.extract_only:
+        timings["total"] = time.perf_counter() - t_all
+        print("\n=== wall-clock ===")
+        print(f"  A  GT index        {_fmt_duration(timings['A_gt_index'])}")
+        print(f"  B  ROI extract     {_fmt_duration(timings['B_roi_extract'])}")
+        print(f"  total              {_fmt_duration(timings['total'])}")
+        return
 
     print("=== [C] concept heads + OOD eval ===")
     t0 = time.perf_counter()

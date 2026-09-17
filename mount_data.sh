@@ -10,7 +10,9 @@
 #   model/{yolo,frcnn}/{voc,bdd}_vanilla.{pt,pth}
 #   data/id , data/ood                          (shared image tars; gt.json is built by run.py)
 #   data/{detector}/{dataset}/training_data.pt
-#   data/{detector}/{dataset}/{roi,native_knn,concept_head_ood}/  (run.py)
+#   data/{detector}/{dataset}/{roi,native_knn,concept_head_ood}/
+#     copied from Drive experiments/{detector}-{dataset}/ when present so
+#     run.py can skip extract / head training
 #
 # Usage:
 #   DETECTOR=yolo DATASET=voc bash mount_data.sh    # default
@@ -23,6 +25,8 @@
 #   shared/datasets/id/{voc,bdd}/...
 #   shared/datasets/ood/{near-ood-voc,near-ood-bdd,far-ood}/...
 #   semantic_training_data/yolo-voc.pt | yolo-bdd.pt | frcnn_voc.pt
+# Optional on Drive (under MyDrive/experiments/{yolo-voc,yolo-bdd,frcnn-voc}/):
+#   roi/  native_knn/  concept_head_ood/
 # FRCNN also needs Detectron2 FX yaml+utils at one of:
 #   shared/models/faster_rcnn/fx/
 #   /content/frcnn_fx/  (upload with run.py)
@@ -36,6 +40,7 @@ DATASET="${DATASET:-voc}"
 ASSETS=/content/drive/MyDrive/assets
 SHARED="$ASSETS/shared"
 SEMANTIC="$ASSETS/semantic_training_data"
+EXPERIMENTS=/content/drive/MyDrive/experiments
 DEST=/content/spk
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
@@ -58,9 +63,12 @@ if [ "$DETECTOR" = frcnn ] && [ "$DATASET" != voc ]; then
   exit 2
 fi
 
+EXP_DIR="$EXPERIMENTS/${DETECTOR}-${DATASET}"
+
 echo "DETECTOR=$DETECTOR  DATASET=$DATASET  DEST=$DEST"
 echo "  model -> $DEST/model/$DETECTOR/"
 echo "  arch  -> $DEST/data/$DETECTOR/$DATASET/"
+echo "  exp   -> $EXP_DIR/{roi,native_knn,concept_head_ood}/  (optional reuse)"
 
 MODEL_DIR="$DEST/model/$DETECTOR"
 ARCH_DIR="$DEST/data/$DETECTOR/$DATASET"
@@ -228,13 +236,34 @@ else
 fi
 
 echo
+reuse_stages=""
+if [ -d "$EXP_DIR" ]; then
+  echo "reusing experiment caches from $EXP_DIR"
+  for stage in roi native_knn concept_head_ood; do
+    src="$EXP_DIR/$stage"
+    if [ -d "$src" ]; then
+      copy_tree "$src" "$ARCH_DIR/$stage"
+      reuse_stages="${reuse_stages:+$reuse_stages, }$stage"
+    else
+      echo "skip $stage (not in $EXP_DIR; run.py will build it)"
+    fi
+  done
+else
+  echo "skip experiment reuse (no $EXP_DIR); run.py will build roi/native_knn/concept_head_ood"
+fi
+
+echo
 echo "gt.json is not copied; run.py stage A builds $DEST/data/id/gt.json from train tars"
 if [ ! -f "$ARCH_DIR/training_data.pt" ]; then
   echo "MISSING $ARCH_DIR/training_data.pt (need a file, not a directory)"
   missing=$((missing + 1))
 fi
 echo "checkpoint -> $MODEL_DIR/"
-echo "outputs    -> $ARCH_DIR/{roi,native_knn,concept_head_ood}/  (created by run.py)"
+if [ -n "$reuse_stages" ]; then
+  echo "reused     -> $ARCH_DIR/{$reuse_stages}/"
+else
+  echo "outputs    -> $ARCH_DIR/{roi,native_knn,concept_head_ood}/  (created by run.py)"
+fi
 echo
 du -sh "$DEST"
 echo "copied $copied file(s), missing=$missing"
