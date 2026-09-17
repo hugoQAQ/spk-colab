@@ -436,17 +436,12 @@ def tune_extract_batch(engine, args: argparse.Namespace) -> int:
         print(f"  extract batch: {args.extract_batch} (manual)", flush=True)
         return args.extract_batch
     if PROFILE.detector == "frcnn":
-        dummy = np.full((800, 1200, 3), 114, dtype=np.uint8)
-
-        def trial(batch: int) -> None:
-            engine.infer_batch_bgr([dummy] * batch)
-
-        chosen = choose_batch_size(
-            trial, args.device, args.vram_frac,
-            min_batch=1, max_batch=8, default=1, label="extract batch",
-        )
-        torch.cuda.empty_cache()
-        return max(chosen, 1)
+        # Detectron2 ImageList pads the whole batch to the largest H/W. Far-OOD
+        # images can be 4k, so GPU batch>1 OOMs even when an 800x1200 trial looks fine.
+        # infer_batch_bgr therefore runs one image at a time; this number is only
+        # how many tars we decode before that loop.
+        print("  extract batch: 8 (FRCNN: decode 8, infer 1 at a time)", flush=True)
+        return 8
 
     dummy = np.full((IMGSZ, IMGSZ, 3), 114, dtype=np.uint8)
     worst_boxes = torch.tensor(
@@ -1033,40 +1028,32 @@ class FRCNNUnifiedForward:
         roi = self.model.roi_heads.box_pooler(feature_list, [self.Boxes(boxes_model.to(self.device))])
         return self._reshape_pooled(roi).detach().cpu().float()
 
-    @torch.inference_mode()
-    def infer_batch_bgr(self, images_bgr: list[np.ndarray]) -> list[UnifiedImageResult]:
-        if not images_bgr:
-            return []
-        batched: list[dict[str, Any]] = []
-        orig_hw: list[tuple[int, int]] = []
-        for image_bgr in images_bgr:
-            image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-            height, width = image.shape[:2]
-            orig_hw.append((height, width))
-            tensor = torch.as_tensor(image.transpose(2, 0, 1), device=self.device)
-            batched.append({"image": tensor, "height": height, "width": width})
-
+    def _infer_one_bgr(self, image_bgr: np.ndarray) -> UnifiedImageResult:
+        image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        orig_h, orig_w = image.shape[:2]
+        tensor = torch.as_tensor(image.transpose(2, 0, 1), device=self.device)
+        batched = [{"image": tensor, "height": orig_h, "width": orig_w}]
         images = self.model.preprocess_image(batched)
         features = self.model.backbone(images.tensor)
-        outputs = self.model.inference(batched)
+        output = self.model.inference(batched)[0]
+        model_h, model_w = images.image_sizes[0]
+        detections = self._parse_instances(output["instances"])
+        native = self._pool_native(features)
+        if detections:
+            boxes = torch.tensor([d["bbox_xyxy"] for d in detections], dtype=torch.float32)
+            boxes_model = boxes.clone()
+            boxes_model[:, [0, 2]] *= float(model_w) / max(orig_w, 1)
+            boxes_model[:, [1, 3]] *= float(model_h) / max(orig_h, 1)
+            roi = self._roi_from_features(features, boxes_model)
+        else:
+            roi = torch.empty((0, self.roi_channels, ROI_SIZE, ROI_SIZE), dtype=torch.float32)
+        return UnifiedImageResult(detections, native, roi)
 
-        results: list[UnifiedImageResult] = []
-        for batch_idx, output in enumerate(outputs):
-            orig_h, orig_w = orig_hw[batch_idx]
-            model_h, model_w = images.image_sizes[batch_idx]
-            detections = self._parse_instances(output["instances"])
-            feat_i = {name: features[name][batch_idx : batch_idx + 1] for name in features}
-            native = self._pool_native(feat_i)
-            if detections:
-                boxes = torch.tensor([d["bbox_xyxy"] for d in detections], dtype=torch.float32)
-                boxes_model = boxes.clone()
-                boxes_model[:, [0, 2]] *= float(model_w) / max(orig_w, 1)
-                boxes_model[:, [1, 3]] *= float(model_h) / max(orig_h, 1)
-                roi = self._roi_from_features(feat_i, boxes_model)
-            else:
-                roi = torch.empty((0, self.roi_channels, ROI_SIZE, ROI_SIZE), dtype=torch.float32)
-            results.append(UnifiedImageResult(detections, native, roi))
-        return results
+    @torch.inference_mode()
+    def infer_batch_bgr(self, images_bgr: list[np.ndarray]) -> list[UnifiedImageResult]:
+        # One image at a time: FPN pads the batch to max H/W, so a single large
+        # Far-OOD photo would otherwise inflate every other image in the batch.
+        return [self._infer_one_bgr(image_bgr) for image_bgr in images_bgr]
 
 
 def build_engine(device: str | torch.device):
