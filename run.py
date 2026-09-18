@@ -1728,6 +1728,64 @@ def unpack_features(block: dict) -> torch.Tensor:
     return block["features"].float()
 
 
+def bundle_feature_channels(bundle: dict) -> int | None:
+    """Channel dim of the first feature block in training_data.pt."""
+    per_class = bundle.get("per_class", bundle)
+    if not isinstance(per_class, dict):
+        return None
+    for entry in per_class.values():
+        if not isinstance(entry, dict):
+            continue
+        for key in ("id", "prox", "unknown", "imagenet_o_fp"):
+            block = entry.get(key)
+            if not isinstance(block, dict):
+                continue
+            if "features_fp8" in block or "features" in block:
+                return int(unpack_features(block).shape[1])
+    return None
+
+
+def roi_cache_channels(path: Path) -> int | None:
+    """Channel dim stored on a stage-B ROI cache, without loading the fp8 tensor if possible."""
+    if not path.is_file():
+        return None
+    header = _unpickle_torch_header(path)
+    if isinstance(header, dict):
+        ch = header.get("feature_channels")
+        if ch is not None:
+            return int(ch)
+        fp8 = header.get("features_fp8")
+        if torch.is_tensor(fp8) and fp8.ndim >= 2:
+            return int(fp8.shape[1])
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if payload.get("feature_channels") is not None:
+        return int(payload["feature_channels"])
+    fp8 = payload.get("features_fp8")
+    if torch.is_tensor(fp8) and fp8.ndim >= 2:
+        return int(fp8.shape[1])
+    return None
+
+
+def first_roi_channels() -> int | None:
+    for filename in ROI_SPLITS.values():
+        ch = roi_cache_channels(ROI_DIR / filename)
+        if ch is not None:
+            return ch
+    return None
+
+
+def _channel_mismatch_exit(training_ch: int, roi_ch: int) -> None:
+    raise SystemExit(
+        f"channel mismatch: training_data.pt has {training_ch} channels, "
+        f"ROI caches have {roi_ch} "
+        f"({PROFILE.detector}/{PROFILE.name} extractor is {PROFILE.feature_channels}-d). "
+        "The concept heads and ROI caches were built with different feature maps. "
+        "Rebuild semantic training_data with the current run.py extractor, "
+        "or restore ROI caches that match the training features. "
+        "--retrain cannot fix this until those two match."
+    )
+
+
 def _append_supervision(
     xs: list[torch.Tensor],
     ys: list[torch.Tensor],
@@ -1986,10 +2044,17 @@ def score_roi_cache(
         prox_channels = [i for i, n in enumerate(concept_order) if n.startswith("prox::")]
         unknown_channel = concept_order.index("unknown")
 
+        head_ch = int(head.stem[0].weight.shape[1])
         for start in range(0, len(row_indices), batch_size):
             chunk = row_indices[start:start + batch_size]
             # float8 tensors do not support fancy indexing on CPU, hence the stack.
             xb = torch.stack([fp8[i].float() * scales[i] for i in chunk]).to(torch_device)
+            if xb.shape[1] != head_ch:
+                raise SystemExit(
+                    f"{cache_path}: ROI features are {xb.shape[1]}-d but {class_name}_head.pt "
+                    f"expects {head_ch}-d. Delete mismatched *_head.pt and retrain only if "
+                    f"training_data.pt also has {xb.shape[1]} channels."
+                )
             with torch.inference_mode():
                 # sigmoid(pooled logit) = "how strongly is this concept present?"
                 activations = torch.sigmoid(pool_logits(head(xb))).cpu().numpy()
@@ -2558,17 +2623,35 @@ def load_or_train_heads(args: argparse.Namespace) -> tuple[dict, list[str]]:
         raise SystemExit(f"classes not in training_data.pt: {missing}")
 
     print(f"  {len(class_names)} class(es) on {args.device}")
+    roi_ch = first_roi_channels()
+    td_ch = bundle_feature_channels(training_data)
+    if roi_ch is not None:
+        print(f"  ROI caches: {roi_ch} channels (profile {PROFILE.feature_channels})", flush=True)
+    if td_ch is not None:
+        print(f"  training_data.pt: {td_ch} channels", flush=True)
     heads = {}
     n_reused = 0
     for class_name in class_names:
         head_path = args.out / f"{class_name}_head.pt"
         if head_path.is_file() and not args.retrain:
             head, concept_order = load_saved_head(head_path, args.device)
-            heads[class_name] = (head, concept_order)
-            n_reused += 1
-            print(f"  [{class_name}] reused {head_path.name} ({len(concept_order)} concepts)", flush=True)
-            continue
+            head_ch = int(head.stem[0].weight.shape[1])
+            if roi_ch is not None and head_ch != roi_ch:
+                print(
+                    f"  [{class_name}] skip reuse {head_path.name}: "
+                    f"head {head_ch}-d vs ROI {roi_ch}-d",
+                    flush=True,
+                )
+            else:
+                heads[class_name] = (head, concept_order)
+                n_reused += 1
+                print(f"  [{class_name}] reused {head_path.name} ({len(concept_order)} concepts)", flush=True)
+                continue
+        if td_ch is not None and roi_ch is not None and td_ch != roi_ch:
+            _channel_mismatch_exit(td_ch, roi_ch)
         x, y, concept_order, groups = build_class_data(training_data, class_name)
+        if roi_ch is not None and int(x.shape[1]) != roi_ch:
+            _channel_mismatch_exit(int(x.shape[1]), roi_ch)
         print(f"  [{class_name}] {len(x):,} ROIs, {len(concept_order)} concepts", flush=True)
         head = train_head(class_name, x, y, groups, args)
         heads[class_name] = (head, concept_order)
