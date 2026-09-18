@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run ood_baseline.py on detector logits from logits_extraction.py (VOC or BDD).
+"""Run ood_baseline.py on detector logits (VOC or BDD).
 
 Expects under --logits-dir:
   BDD: bdd-train.pt  bdd-val.pt  near-ood.pt  far-ood.pt   (--dataset bdd)
@@ -8,19 +8,17 @@ Expects under --logits-dir:
 Converts each .pt to .npz (cached), then runs all eight logit-space OOD baselines
 from ood_baseline.py (MSP, EBO, MLS, SCALE, MDS, BAM, KNN, iForest).
 
-FRCNN logits include a background column (index 20 for VOC, 10 for BDD). Pass
---detector frcnn or rely on background_index stored in the .pt files.
+Detector presets (--detector):
+  yolo / rtdetr  pre-sigmoid logits, no background, MSP via sigmoid
+  frcnn          pre-softmax logits + background (VOC: 20, BDD: 10), MSP via softmax
 
 Examples
 --------
-    # YOLO VOC
-    python eval_voc_logits_baselines.py --dataset voc
-
-    # FRCNN VOC (logits already at /content/spk/data/frcnn/voc/logits)
-    python eval_voc_logits_baselines.py --detector frcnn --dataset voc
-
-    python eval_voc_logits_baselines.py --dataset bdd --methods MSP EBO MLS
-    python eval_voc_logits_baselines.py --dataset bdd --outlier mhood-iqr --force
+    python eval_logits_baselines.py --detector yolo --dataset voc
+    python eval_logits_baselines.py --detector frcnn --dataset voc
+    python eval_logits_baselines.py --detector rtdetr --dataset voc
+    python eval_logits_baselines.py --detector rtdetr --dataset bdd
+    python eval_logits_baselines.py --detector rtdetr --dataset bdd --methods MSP EBO MLS
 """
 from __future__ import annotations
 
@@ -54,11 +52,14 @@ DATASET_SPLITS = {
     },
 }
 
+_SIGMOID_DETECTOR = {
+    "background_index": None,
+    "msp_activation": "sigmoid",
+}
+
 DETECTOR_DEFAULTS = {
-    "yolo": {
-        "background_index": None,
-        "msp_activation": "sigmoid",
-    },
+    "yolo": _SIGMOID_DETECTOR,
+    "rtdetr": _SIGMOID_DETECTOR,
     "frcnn": {
         "background_index": {"voc": 20, "bdd": 10},
         "msp_activation": "softmax",
@@ -192,7 +193,7 @@ def main() -> int:
         "--detector",
         choices=tuple(DETECTOR_DEFAULTS),
         default="yolo",
-        help="yolo or frcnn (default paths + MSP activation + background column)",
+        help="yolo, rtdetr, or frcnn (default paths + MSP activation + background column)",
     )
     parser.add_argument(
         "--logits-dir",
