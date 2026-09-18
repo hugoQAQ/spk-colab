@@ -1537,6 +1537,18 @@ def split_needs_extract(split: str, args: argparse.Namespace) -> tuple[bool, boo
     return need_roi, need_native, need_prior
 
 
+def needs_detector_checkpoint(args: argparse.Namespace, *, run_b: bool, run_c: bool) -> bool:
+    """True when a stage will run detector forward (ROI / native embeddings), not just reuse caches."""
+    if run_b:
+        for split in args.splits:
+            need_roi, need_native, need_prior = split_needs_extract(split, args)
+            if need_roi or need_prior or need_native:
+                return True
+    if run_c and any(not native_ready(native_split_dir(split)) for split in SPLITS):
+        return True
+    return False
+
+
 def save_roi_cache(
     roi_path: Path, split: str, roi_fp8_chunks: list, roi_scale_chunks: list,
     roi_rows: list[dict], num_images: int, elapsed: float,
@@ -1822,6 +1834,21 @@ def _channel_mismatch_exit(training_ch: int, roi_ch: int) -> None:
     )
 
 
+def block_num_samples(block: dict | None) -> int:
+    if not isinstance(block, dict):
+        return 0
+    feats = block.get("features_fp8")
+    if feats is None:
+        feats = block.get("features")
+    return int(feats.shape[0]) if torch.is_tensor(feats) and feats.ndim >= 1 else 0
+
+
+def slice_width(s: slice, n: int) -> int:
+    start = 0 if s.start is None else int(s.start)
+    stop = n if s.stop is None else int(s.stop)
+    return max(stop - start, 0)
+
+
 def _append_supervision(
     xs: list[torch.Tensor],
     ys: list[torch.Tensor],
@@ -1832,6 +1859,8 @@ def _append_supervision(
     has_masks: bool = True,
 ) -> None:
     x = unpack_features(block)
+    if len(x) == 0:
+        return
     masks = block["heatmaps"].float() if has_masks else torch.ones(len(x), 1, 7, 7)
     y = torch.zeros(len(x), n_concepts, *masks.shape[-2:])
     y[:, target_slice] = masks
@@ -1857,19 +1886,20 @@ def build_class_data(bundle: dict, class_name: str):
         part_based = bool(entry.get("is_part_based", True))
     else:
         part_based = prox_block is not None
+    prox_concepts = list(prox_block.get("concept_order") or []) if prox_block else []
+    if part_based and (prox_block is None or not prox_concepts):
+        part_based = False
 
     xs: list[torch.Tensor] = []
     ys: list[torch.Tensor] = []
     if part_based:
-        if prox_block is None:
-            raise ValueError(f"{class_name}: missing prox block")
         concept_order = (
             [f"id::{name}" for name in id_block["concept_order"]]
-            + [f"prox::{name}" for name in prox_block["concept_order"]]
+            + [f"prox::{name}" for name in prox_concepts]
             + ["unknown"]
         )
         n_id = len(id_block["concept_order"])
-        n_prox = len(prox_block["concept_order"])
+        n_prox = len(prox_concepts)
         id_slice = slice(0, n_id)
         prox_slice = slice(n_id, n_id + n_prox)
         unknown_slice = slice(n_id + n_prox, n_id + n_prox + 1)
@@ -1955,10 +1985,16 @@ def soft_dice(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
 def group_ce(logits: torch.Tensor, target: torch.Tensor, groups: list[slice]) -> torch.Tensor:
     """Make the right group (id / prox / unknown) win, not just the right channel."""
+    n_concepts = int(logits.shape[1])
+    active = [g for g in groups if slice_width(g, n_concepts) > 0]
+    if len(active) < 2:
+        return logits.new_zeros(())
     scores = pool_logits(logits)
-    group_scores = torch.stack([scores[:, g].amax(1) for g in groups], dim=1)
-    group_mass = torch.stack([target[:, g].flatten(1).sum(1) for g in groups], dim=1)
+    group_scores = torch.stack([scores[:, g].amax(1) for g in active], dim=1)
+    group_mass = torch.stack([target[:, g].flatten(1).sum(1) for g in active], dim=1)
     valid = group_mass.sum(1) > 0
+    if not bool(valid.any()):
+        return logits.new_zeros(())
     return F.cross_entropy(group_scores[valid], group_mass[valid].argmax(1))
 
 
@@ -3005,6 +3041,9 @@ def load_or_train_heads(args: argparse.Namespace) -> tuple[dict, list[str]]:
         if td_ch is not None and roi_ch is not None and td_ch != roi_ch:
             _channel_mismatch_exit(td_ch, roi_ch)
         x, y, concept_order, groups = build_class_data(training_data, class_name)
+        if len(x) == 0:
+            print(f"  [{class_name}] SKIPPED (no training ROIs in training_data.pt)", flush=True)
+            continue
         if roi_ch is not None and int(x.shape[1]) != roi_ch:
             _channel_mismatch_exit(int(x.shape[1]), roi_ch)
         print(f"  [{class_name}] {len(x):,} ROIs, {len(concept_order)} concepts", flush=True)
@@ -3013,7 +3052,14 @@ def load_or_train_heads(args: argparse.Namespace) -> tuple[dict, list[str]]:
         torch.save({"state_dict": head.state_dict(), "concept_order": concept_order,
                     "class_name": class_name, "seed": int(args.seed)}, head_path)
         del x, y
-    print(f"  heads: reused {n_reused}/{len(class_names)}, trained {len(class_names) - n_reused}", flush=True)
+    class_names = [name for name in class_names if name in heads]
+    if not class_names:
+        raise SystemExit("no concept heads available (all classes empty or skipped)")
+    print(
+        f"  heads: {len(class_names)} class(es); reused {n_reused}, "
+        f"trained {len(class_names) - n_reused}",
+        flush=True,
+    )
     del training_data
 
     return heads, class_names
@@ -3409,9 +3455,13 @@ def main() -> None:
         args.out_root.mkdir(parents=True, exist_ok=True)
         migrate_legacy_heads(args.out_root, args.seeds[0])
 
-    if run_b:
+    if needs_detector_checkpoint(args, run_b=run_b, run_c=run_c):
         if not CHECKPOINT.is_file():
-            raise FileNotFoundError(CHECKPOINT)
+            raise FileNotFoundError(
+                f"{CHECKPOINT} (needed for ROI/native extraction; "
+                "if caches are already mounted use --stage C or --stage D, "
+                "or run mount_data.sh to copy weights)"
+            )
         if PROFILE.detector == "frcnn" and not FRCNN_CFG.is_file():
             raise FileNotFoundError(FRCNN_CFG)
     if run_c and not resolve_training_data(TRAINING_DATA).is_file():
