@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run ood_baseline.py on YOLO logits from logits_extraction.py (VOC or BDD).
+"""Run ood_baseline.py on detector logits from logits_extraction.py (VOC or BDD).
 
 Expects under --logits-dir:
   BDD: bdd-train.pt  bdd-val.pt  near-ood.pt  far-ood.pt   (--dataset bdd)
@@ -8,10 +8,17 @@ Expects under --logits-dir:
 Converts each .pt to .npz (cached), then runs all eight logit-space OOD baselines
 from ood_baseline.py (MSP, EBO, MLS, SCALE, MDS, BAM, KNN, iForest).
 
+FRCNN logits include a background column (index 20 for VOC, 10 for BDD). Pass
+--detector frcnn or rely on background_index stored in the .pt files.
+
 Examples
 --------
+    # YOLO VOC
     python eval_voc_logits_baselines.py --dataset voc
-    python eval_voc_logits_baselines.py --dataset bdd
+
+    # FRCNN VOC (logits already at /content/spk/data/frcnn/voc/logits)
+    python eval_voc_logits_baselines.py --detector frcnn --dataset voc
+
     python eval_voc_logits_baselines.py --dataset bdd --methods MSP EBO MLS
     python eval_voc_logits_baselines.py --dataset bdd --outlier mhood-iqr --force
 """
@@ -35,6 +42,7 @@ DATASET_SPLITS = {
         "near_ood": "near-ood.pt",
         "far_ood": "far-ood.pt",
         "bam_density": 5.0,
+        "background_index": None,
     },
     "bdd": {
         "train": "bdd-train.pt",
@@ -42,6 +50,18 @@ DATASET_SPLITS = {
         "near_ood": "near-ood.pt",
         "far_ood": "far-ood.pt",
         "bam_density": 50.0,
+        "background_index": None,
+    },
+}
+
+DETECTOR_DEFAULTS = {
+    "yolo": {
+        "background_index": None,
+        "msp_activation": "sigmoid",
+    },
+    "frcnn": {
+        "background_index": {"voc": 20, "bdd": 10},
+        "msp_activation": "softmax",
     },
 }
 
@@ -52,6 +72,9 @@ def load_logits_pt(path: Path) -> dict:
     pred_labels = np.asarray(payload["pred_labels"], dtype=np.int64)
     detection_ids = np.asarray(payload["detection_ids"], dtype=str)
     class_names = np.asarray(payload["class_names"], dtype=str)
+    background_index = payload.get("background_index")
+    if background_index is not None:
+        background_index = int(background_index)
     if logits.ndim != 2:
         raise ValueError(f"{path}: logits must be [N, C], got {logits.shape}")
     if pred_labels.shape != (logits.shape[0],):
@@ -67,6 +90,7 @@ def load_logits_pt(path: Path) -> dict:
         "pred_labels": pred_labels,
         "detection_ids": detection_ids,
         "class_names": class_names,
+        "background_index": background_index,
         "split": payload.get("split", path.stem),
         "num_detections": int(logits.shape[0]),
     }
@@ -83,10 +107,17 @@ def write_npz(path: Path, payload: dict) -> None:
     )
 
 
+def read_background_index(pt_path: Path) -> int | None:
+    payload = torch.load(pt_path, map_location="cpu", weights_only=False)
+    value = payload.get("background_index")
+    return int(value) if value is not None else None
+
+
 def convert_splits(
     logits_dir: Path, cache_dir: Path, split_files: dict[str, str], force: bool,
-) -> dict[str, Path]:
+) -> tuple[dict[str, Path], int | None]:
     npz_paths: dict[str, Path] = {}
+    background_index: int | None = None
     print(f"logits dir: {logits_dir}", flush=True)
     print(f"npz cache:  {cache_dir}", flush=True)
     for key, filename in split_files.items():
@@ -94,6 +125,14 @@ def convert_splits(
         if not pt_path.is_file():
             raise FileNotFoundError(f"missing {pt_path}")
         npz_path = cache_dir / f"{Path(filename).stem}.npz"
+        pt_bg = read_background_index(pt_path)
+        if pt_bg is not None:
+            if background_index is None:
+                background_index = pt_bg
+            elif background_index != pt_bg:
+                raise ValueError(
+                    f"{pt_path}: background_index={pt_bg} != {background_index} from earlier split"
+                )
         if npz_path.is_file() and not force:
             print(f"  reuse {npz_path.name}", flush=True)
         else:
@@ -104,7 +143,7 @@ def convert_splits(
                 flush=True,
             )
         npz_paths[key] = npz_path
-    return npz_paths
+    return npz_paths, background_index
 
 
 def build_baseline_args(args: argparse.Namespace, npz_paths: dict[str, Path]) -> SimpleNamespace:
@@ -150,10 +189,16 @@ def main() -> int:
     )
     parser.add_argument("--dataset", choices=tuple(DATASET_SPLITS), default="voc")
     parser.add_argument(
+        "--detector",
+        choices=tuple(DETECTOR_DEFAULTS),
+        default="yolo",
+        help="yolo or frcnn (default paths + MSP activation + background column)",
+    )
+    parser.add_argument(
         "--logits-dir",
         type=Path,
         default=None,
-        help="Directory with split .pt files (default: /content/spk/data/yolo/{dataset}/logits)",
+        help="Directory with split .pt files (default: /content/spk/data/{detector}/{dataset}/logits)",
     )
     parser.add_argument(
         "--cache-dir",
@@ -165,7 +210,7 @@ def main() -> int:
         "--out",
         type=Path,
         default=None,
-        help="ood_baseline output dir (default: .../data/yolo/{dataset}/logits_baselines)",
+        help="ood_baseline output dir (default: .../data/{detector}/{dataset}/logits_baselines)",
     )
     parser.add_argument(
         "--methods",
@@ -175,9 +220,9 @@ def main() -> int:
         help="Baselines to run (default: all eight)",
     )
     parser.add_argument("--background-index", type=int, default=None,
-                        help="Explicit background logit column; YOLO VOC has none")
+                        help="Background logit column (default: from .pt or detector preset)")
     parser.add_argument("--msp-denominator", choices=["all", "foreground"], default="all")
-    parser.add_argument("--msp-activation", choices=["softmax", "sigmoid"], default="softmax")
+    parser.add_argument("--msp-activation", choices=["softmax", "sigmoid"], default=None)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--scale-percentile", type=float, default=65.0)
     parser.add_argument("--scale-degenerate", choices=["error", "identity"], default="error")
@@ -217,26 +262,42 @@ def main() -> int:
     args = parser.parse_args()
 
     profile = DATASET_SPLITS[args.dataset]
-    split_files = {k: v for k, v in profile.items() if k != "bam_density"}
+    detector = DETECTOR_DEFAULTS[args.detector]
+    split_files = {
+        k: v for k, v in profile.items() if k not in ("bam_density", "background_index")
+    }
     if args.logits_dir is None:
-        args.logits_dir = Path(f"/content/spk/data/yolo/{args.dataset}/logits")
+        args.logits_dir = Path(f"/content/spk/data/{args.detector}/{args.dataset}/logits")
     if args.out is None:
-        args.out = Path(f"/content/spk/data/yolo/{args.dataset}/logits_baselines")
+        args.out = Path(f"/content/spk/data/{args.detector}/{args.dataset}/logits_baselines")
     if args.bam_density is None:
         args.bam_density = float(profile["bam_density"])
+    if args.msp_activation is None:
+        args.msp_activation = detector["msp_activation"]
 
     cache_dir = args.cache_dir or (args.logits_dir / "npz")
-    npz_paths = convert_splits(args.logits_dir, cache_dir, split_files, force=args.force)
+    npz_paths, pt_background = convert_splits(
+        args.logits_dir, cache_dir, split_files, force=args.force
+    )
+    if args.background_index is None:
+        preset = detector["background_index"]
+        if isinstance(preset, dict):
+            preset = preset.get(args.dataset)
+        args.background_index = pt_background if pt_background is not None else preset
     if args.convert_only:
         print("convert-only: done", flush=True)
         return 0
 
     baseline_args = build_baseline_args(args, npz_paths)
     print(
-        f"\n=== ood_baseline ({args.dataset}) -> {args.out} ===",
+        f"\n=== ood_baseline ({args.detector}/{args.dataset}) -> {args.out} ===",
         flush=True,
     )
-    print(f"bam_density={args.bam_density}", flush=True)
+    print(
+        f"bam_density={args.bam_density}  background_index={args.background_index}  "
+        f"msp_activation={args.msp_activation}",
+        flush=True,
+    )
     print(f"methods: {', '.join(baseline_args.methods)}", flush=True)
     with threadpool_limits(limits=baseline_args.jobs):
         code = ood_baseline.run(baseline_args)
