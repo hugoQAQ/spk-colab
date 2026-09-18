@@ -3,13 +3,18 @@
 
 Three stages, run in order:
 
-  A  GT INDEX   decode YOLO `.txt` labels in ID-train tars -> data/id/gt.json
+  A  GT INDEX   decode YOLO `.txt` labels in ID-train tars -> data/id/gt_{voc,bdd}.json
   B  EXTRACT    one detector forward per image; cache float8 ROI features
                 (YOLO 896x7x7, FRCNN 256x7x7)
                 -> data/{detector}/{dataset}/roi/{id_train,id_val,near_ood,far_ood}.pt
   C  TRAIN+EVAL concept heads from data/{detector}/{dataset}/training_data.pt,
                 SPK4 + native kNN, classwise Isolation Forest
-                -> data/{detector}/{dataset}/concept_head_ood/
+                -> data/{detector}/{dataset}/concept_head_ood/seed_{42,43,44}/
+                pooled mean±std at concept_head_ood/pooled_mean_std.json
+
+Default protocol is three independent concept-head seeds (42, 43, 44). Stage A/B
+run once; stage C retrains heads and rescores ROIs per seed. `--seed N` runs a
+single seed. Headline FPR95 / AUROC tables use no ID-val outlier removal.
 
 Checkpoints live under model/{detector}/ so one Colab session can hold YOLO and FRCNN.
 Image tars under data/id and data/ood are shared across detectors.
@@ -20,12 +25,13 @@ Examples
 --------
     DETECTOR=yolo DATASET=voc bash mount_data.sh
     python run.py --root /content/spk --detector yolo --dataset voc
+    python run.py --root /content/spk --detector yolo --dataset voc --seed 42
 
     DETECTOR=yolo DATASET=bdd bash mount_data.sh
     python run.py --root /content/spk --detector yolo --dataset bdd --max-images 200 --epochs 6
     python run.py --root /content/spk --detector yolo --dataset bdd --splits near_ood far_ood --force --extract-only
     # After mount_data.sh copied roi/native_knn/concept_head_ood, this skips
-    # extract and head training; it only builds gt.json if missing, then eval.
+    # extract and head training; it only builds gt_{dataset}.json if missing, then eval.
     python run.py --root /content/spk --detector yolo --dataset bdd
 
     DETECTOR=frcnn DATASET=voc bash mount_data.sh
@@ -40,6 +46,7 @@ import csv
 import io
 import json
 import pickle
+import shutil
 import tarfile
 import time
 import zipfile
@@ -55,6 +62,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from sklearn.ensemble import IsolationForest
+from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 from torchvision.ops import nms, roi_align
@@ -70,7 +78,7 @@ DATASET_DIR = ROOT / "data/id"
 OOD_DIR = ROOT / "data/ood"
 ARCH_DIR = ROOT / "data/yolo/voc"
 ROI_DIR = ARCH_DIR / "roi"
-GT_INDEX = ROOT / "data/id/gt.json"
+GT_INDEX = ROOT / "data/id/gt_voc.json"
 TRAINING_DATA = ARCH_DIR / "training_data.pt"
 NATIVE_ROOT = ARCH_DIR / "native_knn"
 PRIOR_DIR = ARCH_DIR / "detection_prior_rows"
@@ -278,7 +286,7 @@ def refresh_paths() -> None:
     OOD_DIR = ROOT / "data/ood"
     ARCH_DIR = ROOT / "data" / PROFILE.detector / PROFILE.name
     ROI_DIR = ARCH_DIR / "roi"
-    GT_INDEX = ROOT / "data/id/gt.json"
+    GT_INDEX = ROOT / "data/id" / f"gt_{PROFILE.name}.json"
     TRAINING_DATA = ARCH_DIR / "training_data.pt"
     NATIVE_ROOT = ARCH_DIR / "native_knn"
     PRIOR_DIR = ARCH_DIR / "detection_prior_rows"
@@ -600,6 +608,41 @@ def build_gt_index(source_dir: Path, output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(index, separators=(",", ":")) + "\n")
     print(f"  {len(paths)} tars, {len(index)} images -> {output}")
+
+
+def _sample_id_train_stems(source_dir: Path, limit: int = 16) -> list[str]:
+    paths = sorted(source_dir.glob(PROFILE.gt_train_glob))
+    if not paths:
+        return []
+    stems: list[str] = []
+    with tarfile.open(paths[0]) as archive:
+        for member in archive.getmembers():
+            if not member.isfile():
+                continue
+            suffix = Path(member.name).suffix.lower()
+            if suffix not in IMAGE_SUFFIXES and suffix != ".txt":
+                continue
+            stems.append(Path(member.name).stem)
+            if len(stems) >= limit:
+                break
+    return stems
+
+
+def gt_index_is_current(path: Path, source_dir: Path) -> bool:
+    """True if `path` indexes this dataset's ID-train tars (not a leftover VOC file)."""
+    if not path.is_file():
+        return False
+    try:
+        index = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(index, dict) or not index:
+        return False
+    stems = _sample_id_train_stems(source_dir)
+    if not stems:
+        return False
+    hits = sum(stem in index for stem in stems)
+    return hits >= max(1, len(stems) // 2)
 
 
 # ===========================================================================
@@ -1794,7 +1837,12 @@ def keep_true_positives(frame: pd.DataFrame, gt_index_path: Path) -> pd.DataFram
     columns = ["class", "file_name", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2"]
     keep = []
     for class_name, file_name, x1, y1, x2, y2 in frame[columns].to_numpy():
-        candidates = ground_truth.get(Path(file_name).stem, [])
+        raw = str(file_name)
+        candidates = (
+            ground_truth.get(Path(canonical_file_name(raw)).stem)
+            or ground_truth.get(Path(raw).stem)
+            or []
+        )
         best = max(
             (iou([x1, y1, x2, y2], gt["bbox_xyxy"]) for gt in candidates if gt["class"] == class_name),
             default=0.0,
@@ -1895,6 +1943,8 @@ def evaluate(
     cat = {name: np.concatenate(parts) if parts else np.zeros(0) for name, parts in pooled.items()}
     near_fpr = fpr95(cat["id_val"], cat["near_ood"])
     far_fpr = fpr95(cat["id_val"], cat["far_ood"])
+    finite = [x for x in (near_fpr, far_fpr) if np.isfinite(x)]
+    mean_fpr = float(np.mean(finite)) if finite else float("nan")
     return {
         "method": "spk full" if KNN_COL in feature_cols else "spk local",
         "features": list(feature_cols),
@@ -1907,7 +1957,7 @@ def evaluate(
         "per_class": per_class,
         "pooled": {
             "near_fpr95": near_fpr, "far_fpr95": far_fpr,
-            "mean_fpr95": float(np.nanmean([near_fpr, far_fpr])),
+            "mean_fpr95": mean_fpr,
             "n_id_val": len(cat["id_val"]),
             "n_near_ood": len(cat["near_ood"]), "n_far_ood": len(cat["far_ood"]),
         },
@@ -2142,6 +2192,12 @@ def train_and_eval(args: argparse.Namespace) -> None:
     id_train = activations[activations["data_source"] == "id_train"]
     id_train_tp = keep_true_positives(id_train, GT_INDEX)
     print(f"  ID-train true positives: {len(id_train_tp):,} of {len(id_train):,}", flush=True)
+    if len(id_train) and len(id_train_tp) == 0:
+        raise SystemExit(
+            f"ID-train TP filter kept 0/{len(id_train)} ROIs using {GT_INDEX}. "
+            "The GT index is almost certainly the wrong dataset (shared data/id/gt.json "
+            "leftover). Delete it or let stage A rebuild data/id/gt_{dataset}.json."
+        )
 
     knn_tables = build_native_knn_tables(id_train_tp, class_names)
     tp_index = id_train_tp.index
@@ -2219,7 +2275,7 @@ def print_skip_plan(args: argparse.Namespace) -> None:
     activations_path = args.out / "activations.csv"
     print("=== skip plan (--force / --retrain / --rescore to override) ===", flush=True)
     print(
-        f"  A  GT index           {'skip' if GT_INDEX.is_file() else 'run   (no gt.json yet)'}",
+        f"  A  GT index           {'skip' if gt_index_is_current(GT_INDEX, DATASET_DIR) else f'run   ({GT_INDEX.name})'}",
         flush=True,
     )
     b_run = False
@@ -2370,9 +2426,11 @@ def main() -> None:
 
     print("=== [A] GT index ===")
     t0 = time.perf_counter()
-    if GT_INDEX.is_file():
-        print(f"  {GT_INDEX} exists, skipping")
+    if gt_index_is_current(GT_INDEX, DATASET_DIR):
+        print(f"  {GT_INDEX} matches {PROFILE.name} ID-train, skipping")
     else:
+        if GT_INDEX.is_file():
+            print(f"  {GT_INDEX} exists but does not match {PROFILE.name} ID-train; rebuilding")
         build_gt_index(DATASET_DIR, GT_INDEX)
     timings["A_gt_index"] = time.perf_counter() - t0
     print(f"  stage A wall {_fmt_duration(timings['A_gt_index'])}")

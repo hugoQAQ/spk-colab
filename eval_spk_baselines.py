@@ -8,7 +8,7 @@ run.py concept-head evaluation.
 Example (YOLO VOC on Colab):
   python eval_spk_baselines.py \\
     --activations /content/spk/data/yolo/voc/concept_head_ood/activations.csv \\
-    --gt-index /content/spk/data/id/gt.json \\
+    --gt-index /content/spk/data/id/gt_voc.json \\
     --out /content/spk/data/yolo/voc/spk_baselines
 """
 from __future__ import annotations
@@ -28,6 +28,9 @@ import ood_baseline
 
 SPK4 = ["known_max", "unknown", "proxy_max", "relative_area"]
 SPK_FULL = SPK4 + ["native_knn"]
+SPK_METHODS = ["MDS", "BAM", "KNN", "iForest"]
+DISPLAY_NAME = {"MDS": "SPK MDS", "BAM": "SPK BAM", "KNN": "SPK KNN", "iForest": "SPK IF"}
+SEEDS = (42, 43, 44)
 
 SPLIT_MAP = {
     "id_train": "train",
@@ -71,15 +74,19 @@ def frame_to_split(frame: pd.DataFrame, feature_cols: list[str], class_map: dict
         raise ValueError("non-finite SPK features")
     labels = frame["class"].astype(str).map(class_map).to_numpy(dtype=np.int64)
     ids = (
-        frame["file_name"].astype(str)
+        frame.index.astype(str)
         + ":"
-        + frame["bbox_x1"].map(lambda v: f"{float(v):.2f}")
+        + frame["class"].astype(str)
         + ":"
-        + frame["bbox_y1"].map(lambda v: f"{float(v):.2f}")
+        + frame["file_name"].astype(str)
         + ":"
-        + frame["bbox_x2"].map(lambda v: f"{float(v):.2f}")
+        + frame["bbox_x1"].map(lambda v: f"{float(v):.4f}")
         + ":"
-        + frame["bbox_y2"].map(lambda v: f"{float(v):.2f}")
+        + frame["bbox_y1"].map(lambda v: f"{float(v):.4f}")
+        + ":"
+        + frame["bbox_x2"].map(lambda v: f"{float(v):.4f}")
+        + ":"
+        + frame["bbox_y2"].map(lambda v: f"{float(v):.4f}")
     ).to_numpy(dtype=str)
     if len(np.unique(ids)) != len(ids):
         raise ValueError("detection_ids not unique within split")
@@ -87,7 +94,14 @@ def frame_to_split(frame: pd.DataFrame, feature_cols: list[str], class_map: dict
 
 
 def method_label(method: str) -> str:
-    return f"{method}-spk"
+    return DISPLAY_NAME.get(method, f"SPK {method}")
+
+
+def _fmt_mean_std(values: list[float]) -> str:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0 or not np.isfinite(arr).any():
+        return "nan"
+    return f"{float(np.mean(arr)):6.2f} ± {float(np.std(arr, ddof=1) if arr.size > 1 else 0.0):.2f}"
 
 
 def run_eval(args: argparse.Namespace) -> int:
@@ -108,6 +122,11 @@ def run_eval(args: argparse.Namespace) -> int:
             before = len(part)
             part = keep_true_positives(part, args.gt_index)
             print(f"  train TP filter: {len(part):,} / {before:,}", flush=True)
+        finite = np.isfinite(part[args.features].to_numpy(dtype=np.float64)).all(axis=1)
+        dropped = int((~finite).sum())
+        if dropped:
+            print(f"  {dst}: dropped {dropped} non-finite feature rows", flush=True)
+        part = part.loc[finite].copy()
         splits[dst] = part
         print(f"  {dst}: {len(part):,} rows", flush=True)
 
@@ -121,79 +140,90 @@ def run_eval(args: argparse.Namespace) -> int:
     if "id_val" not in data or not len(data["id_val"]["x"]):
         raise SystemExit("empty id_val split")
 
-    baseline_args = SimpleNamespace(
-        mds_labels="predicted",
-        covariance=args.covariance,
-        knn_mode=args.knn_mode,
-        knn_k=args.knn_k,
-        bam_density=args.bam_density,
-        bam_max_boxes=args.bam_max_boxes,
-        bam_cluster=args.bam_cluster,
-        iforest_scope="classwise",
-        trees=200,
-        iforest_samples=512,
-        seed=args.seed,
-        jobs=args.jobs,
-        batch_size=args.batch_size,
-        scale_percentile=65.0,
-        scale_degenerate="error",
-        msp_denominator="all",
-        msp_activation="softmax",
-        temperature=1.0,
-    )
-
-    train_x = data["train"]["x"]
-    train_y = data["train"]["labels"]
-    if args.max_train_per_class:
-        ix = ood_baseline.train_indices(train_y, args.max_train_per_class, args.seed)
-        train_x, train_y = train_x[ix], train_y[ix]
-
     args.out.mkdir(parents=True, exist_ok=True)
     eval_names = [k for k in data if k != "train"]
+    ood_splits = [k for k in eval_names if k != "id_val"]
     rows = []
+    by_method: dict[str, dict[str, dict[str, list[float]]]] = {
+        method_label(m): {split: {"fpr95_pct": [], "auroc_pct": []} for split in ood_splits}
+        for m in args.methods
+    }
     report = {
         "feature_set": list(args.features),
         "train_tp_only": args.train_tp_only,
+        "outlier_removal": "none",
         "classes": class_names,
+        "seeds": list(args.seeds),
         "methods": {},
         "errors": {},
     }
 
-    print(f"\n=== SPK baselines ({len(args.features)}D) -> {args.out} ===", flush=True)
+    print(f"\n=== SPK baselines ({len(args.features)}D, outlier=none) -> {args.out} ===", flush=True)
     print(
-        f"train={len(train_x):,}  bam_density={args.bam_density}  "
-        f"mds_labels=predicted  knn_k={args.knn_k}",
+        f"train={len(data['train']['x']):,}  seeds={list(args.seeds)}  "
+        f"bam_density={args.bam_density}  knn_k={args.knn_k}",
         flush=True,
     )
 
-    for method in args.methods:
-        label = method_label(method)
-        started = time.perf_counter()
-        try:
-            print(f"[{label}] fitting/scoring", flush=True)
-            model = ood_baseline.fit_model(method, train_x, train_y, baseline_args)
-            scores = {}
-            fallbacks = {}
-            for split in eval_names:
-                scores[split], fallbacks[split] = ood_baseline.score(
-                    method, model, data[split], baseline_args
+    for seed in args.seeds:
+        baseline_args = SimpleNamespace(
+            mds_labels="predicted",
+            covariance=args.covariance,
+            knn_mode=args.knn_mode,
+            knn_k=args.knn_k,
+            bam_density=args.bam_density,
+            bam_max_boxes=args.bam_max_boxes,
+            bam_cluster=args.bam_cluster,
+            iforest_scope="classwise",
+            trees=200,
+            iforest_samples=512,
+            seed=seed,
+            jobs=args.jobs,
+            batch_size=args.batch_size,
+            scale_percentile=65.0,
+            scale_degenerate="error",
+            msp_denominator="all",
+            msp_activation="softmax",
+            temperature=1.0,
+        )
+        train_x = data["train"]["x"]
+        train_y = data["train"]["labels"]
+        if args.max_train_per_class:
+            ix = ood_baseline.train_indices(train_y, args.max_train_per_class, seed)
+            train_x, train_y = train_x[ix], train_y[ix]
+        print(f"\n--- seed {seed} train={len(train_x):,} ---", flush=True)
+
+        for method in args.methods:
+            label = method_label(method)
+            started = time.perf_counter()
+            try:
+                print(f"[{label}] fitting/scoring", flush=True)
+                model = ood_baseline.fit_model(method, train_x, train_y, baseline_args)
+                scores = {}
+                fallbacks = {}
+                for split in eval_names:
+                    scores[split], fallbacks[split] = ood_baseline.score(
+                        method, model, data[split], baseline_args
+                    )
+                wall = time.perf_counter() - started
+                seed_result = dict(
+                    fallback_rows=fallbacks,
+                    evaluations={"full_id": {}},
+                    wall_seconds=wall,
                 )
-            result = dict(
-                fallback_rows=fallbacks,
-                evaluations={"full_id": {}},
-                wall_seconds=time.perf_counter() - started,
-            )
-            for split in eval_names:
-                if split == "id_val":
-                    continue
-                metrics = ood_baseline.metrics(scores["id_val"], scores[split])
-                result["evaluations"]["full_id"][split] = metrics
-                rows.append(dict(method=label, protocol="full_id", split=split, **metrics))
-            report["methods"][label] = result
-            print(f"[{label}] done in {result['wall_seconds']:.2f}s", flush=True)
-        except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
-            report["errors"][label] = str(exc)
-            print(f"[{label}] FAILED: {exc}", flush=True)
+                for split in ood_splits:
+                    metrics = ood_baseline.metrics(scores["id_val"], scores[split])
+                    seed_result["evaluations"]["full_id"][split] = metrics
+                    rows.append(dict(method=label, seed=seed, protocol="full_id", split=split, **metrics))
+                    if metrics.get("fpr95_pct") is not None:
+                        by_method[label][split]["fpr95_pct"].append(float(metrics["fpr95_pct"]))
+                    if metrics.get("auroc_pct") is not None:
+                        by_method[label][split]["auroc_pct"].append(float(metrics["auroc_pct"]))
+                report["methods"].setdefault(label, {})[str(seed)] = seed_result
+                print(f"[{label}] done in {wall:.2f}s", flush=True)
+            except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
+                report["errors"][f"{label}/seed{seed}"] = str(exc)
+                print(f"[{label}] FAILED: {exc}", flush=True)
 
     (args.out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     if rows:
@@ -201,6 +231,29 @@ def run_eval(args: argparse.Namespace) -> int:
             writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
             writer.writeheader()
             writer.writerows(rows)
+
+    print("\n=== 3-seed mean ± std (outlier removal: none) ===", flush=True)
+    header = f"{'method':10s} {'near FPR95':14s} {'far FPR95':14s} {'near AUROC':14s} {'far AUROC':14s}"
+    print(header, flush=True)
+    pooled_rows = []
+    for method in args.methods:
+        label = method_label(method)
+        near = by_method[label].get("near_ood", {"fpr95_pct": [], "auroc_pct": []})
+        far = by_method[label].get("far_ood", {"fpr95_pct": [], "auroc_pct": []})
+        line = (
+            f"{label:10s} {_fmt_mean_std(near['fpr95_pct']):14s} {_fmt_mean_std(far['fpr95_pct']):14s} "
+            f"{_fmt_mean_std(near['auroc_pct']):14s} {_fmt_mean_std(far['auroc_pct']):14s}"
+        )
+        print(line, flush=True)
+        pooled_rows.append({
+            "method": label,
+            "outlier_removal": "none",
+            "near_fpr95": _fmt_mean_std(near["fpr95_pct"]).strip(),
+            "far_fpr95": _fmt_mean_std(far["fpr95_pct"]).strip(),
+            "near_auroc": _fmt_mean_std(near["auroc_pct"]).strip(),
+            "far_auroc": _fmt_mean_std(far["auroc_pct"]).strip(),
+        })
+    (args.out / "pooled_mean_std.json").write_text(json.dumps(pooled_rows, indent=2) + "\n")
 
     print("\n=== summary.csv ===", flush=True)
     if (args.out / "summary.csv").is_file():
@@ -212,11 +265,12 @@ def run_eval(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--activations", type=Path, required=True)
-    parser.add_argument("--gt-index", type=Path, default=Path("/content/spk/data/id/gt.json"))
+    parser.add_argument("--gt-index", type=Path, default=Path("/content/spk/data/id/gt_voc.json"))
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--features", nargs="+", choices=["known_max", "unknown", "proxy_max", "relative_area", "native_knn"],
                         default=SPK_FULL, help="SPK feature columns (default: spk full 5D)")
-    parser.add_argument("--methods", nargs="+", choices=["BAM", "KNN", "MDS"], default=["BAM", "KNN", "MDS"])
+    parser.add_argument("--methods", nargs="+", choices=["BAM", "KNN", "MDS", "iForest"],
+                        default=SPK_METHODS)
     parser.add_argument("--train-tp-only", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--bam-density", type=float, default=5.0)
     parser.add_argument("--bam-max-boxes", type=int, default=256)
@@ -225,10 +279,14 @@ def main() -> int:
     parser.add_argument("--knn-k", type=int, default=5)
     parser.add_argument("--covariance", choices=["empirical", "ledoit-wolf"], default="empirical")
     parser.add_argument("--max-train-per-class", type=int, default=0)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=None, help="Deprecated: use --seeds")
+    parser.add_argument("--seeds", nargs="+", type=int, default=list(SEEDS),
+                        help="RNG seeds for BAM / iForest (default: 42 43 44)")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=512)
     args = parser.parse_args()
+    if args.seed is not None:
+        args.seeds = [args.seed]
     with threadpool_limits(limits=args.jobs):
         return run_eval(args)
 

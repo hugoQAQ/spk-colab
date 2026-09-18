@@ -8,7 +8,7 @@
 #
 # Layout under DEST=/content/spk:
 #   model/{yolo,frcnn,rtdetr}/{voc,bdd}_vanilla.{pt,pth}
-#   data/id , data/ood                          (shared image tars; gt.json is built by run.py)
+#   data/id , data/ood                          (shared image tars; gt_{dataset}.json is built by run.py)
 #   data/{detector}/{dataset}/training_data.pt
 #   data/{detector}/{dataset}/{roi,native_knn,concept_head_ood}/
 #     copied from Drive experiments/{detector}-{dataset}/ when present so
@@ -196,6 +196,22 @@ copy_tree() {  # copy_tree <src-dir> <dest-dir>
   copied=$((copied + 1))
 }
 
+# Drive sometimes stores a nested copy (experiments/frcnn-voc/roi/roi/*.pt).
+# run.py expects files at data/{detector}/{dataset}/roi/{id_train,id_val,...}.pt.
+unwrap_stage_src() {
+  local src=$1 stage=$2 nested="$1/$2"
+  if [ -d "$nested" ]; then
+    local top_files nested_files
+    top_files=$(find "$src" -maxdepth 1 -type f | head -n 1)
+    nested_files=$(find "$nested" -maxdepth 2 -type f | head -n 1)
+    if [ -z "$top_files" ] && [ -n "$nested_files" ]; then
+      echo "note: unwrapping nested $nested/"
+      src=$nested
+    fi
+  fi
+  printf '%s' "$src"
+}
+
 copy_voc_images() {
   copy "$SHARED/datasets/id/voc/voc_yolo_train-*.tar"          "$DEST/data/id/"
   copy "$SHARED/datasets/id/voc/voc_yolo_val-000000.tar"       "$DEST/data/id/"
@@ -263,6 +279,7 @@ if [ -d "$EXP_DIR" ]; then
   for stage in roi native_knn concept_head_ood; do
     src="$EXP_DIR/$stage"
     if [ -d "$src" ]; then
+      src=$(unwrap_stage_src "$src" "$stage")
       copy_tree "$src" "$ARCH_DIR/$stage"
       reuse_stages="${reuse_stages:+$reuse_stages, }$stage"
     else
@@ -274,7 +291,7 @@ else
 fi
 
 echo
-echo "gt.json is not copied; run.py stage A builds $DEST/data/id/gt.json from train tars"
+echo "gt_{dataset}.json is not copied; run.py stage A builds $DEST/data/id/gt_${DATASET}.json from train tars"
 if [ ! -f "$ARCH_DIR/training_data.pt" ]; then
   echo "MISSING $ARCH_DIR/training_data.pt (need a file, not a directory)"
   missing=$((missing + 1))
