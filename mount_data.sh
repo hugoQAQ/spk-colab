@@ -14,13 +14,13 @@
 #     copied from Drive experiments/{detector}-{dataset}/ when present so
 #     run.py can skip extract / head training
 #
-# Usage:
-#   DETECTOR=yolo DATASET=voc bash mount_data.sh    # default
+# Usage (env or flags; flags win):
 #   DETECTOR=yolo DATASET=bdd bash mount_data.sh
-#   DETECTOR=frcnn DATASET=voc bash mount_data.sh
-#   DETECTOR=frcnn DATASET=bdd bash mount_data.sh
-#   DETECTOR=rtdetr DATASET=voc bash mount_data.sh
-#   DETECTOR=rtdetr DATASET=bdd bash mount_data.sh
+#   bash mount_data.sh --detector yolo --dataset bdd
+#   bash mount_data.sh --detector yolo --dataset bdd --eval-only
+#     copies concept_head_ood (+ gt json if found); skip images/weights
+# Then:
+#   python eval_spk_baselines.py --detector yolo --dataset bdd
 #
 # Expects on Drive (under MyDrive/assets/):
 #   shared/models/yolo/{voc,bdd}_vanilla.pt
@@ -41,12 +41,32 @@
 # subprocess.run(..., capture_output=True) only shows the bar after each file.
 DETECTOR="${DETECTOR:-yolo}"
 DATASET="${DATASET:-voc}"
+EVAL_ONLY=0
 ASSETS=/content/drive/MyDrive/assets
 SHARED="$ASSETS/shared"
 SEMANTIC="$ASSETS/semantic_training_data"
 EXPERIMENTS=/content/drive/MyDrive/experiments
 DEST=/content/spk
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --detector) DETECTOR="$2"; shift 2 ;;
+    --dataset) DATASET="$2"; shift 2 ;;
+    --dest) DEST="$2"; shift 2 ;;
+    --eval-only) EVAL_ONLY=1; shift ;;
+    -h|--help)
+      echo "Usage: $0 [--detector yolo|frcnn|rtdetr] [--dataset voc|bdd] [--eval-only] [--dest /content/spk]"
+      echo "  or: DETECTOR=yolo DATASET=bdd $0"
+      echo "SPK eval after mount: python eval_spk_baselines.py --detector \$DETECTOR --dataset \$DATASET"
+      exit 0
+      ;;
+    *)
+      echo "unknown argument: $1 (use --detector --dataset --eval-only --dest)"
+      exit 2
+      ;;
+  esac
+done
 
 case "$DETECTOR" in
   yolo|frcnn|rtdetr) ;;
@@ -65,7 +85,7 @@ esac
 
 EXP_DIR="$EXPERIMENTS/${DETECTOR}-${DATASET}"
 
-echo "DETECTOR=$DETECTOR  DATASET=$DATASET  DEST=$DEST"
+echo "DETECTOR=$DETECTOR  DATASET=$DATASET  DEST=$DEST  EVAL_ONLY=$EVAL_ONLY"
 echo "  model -> $DEST/model/$DETECTOR/"
 echo "  arch  -> $DEST/data/$DETECTOR/$DATASET/"
 echo "  exp   -> $EXP_DIR/{roi,native_knn,concept_head_ood}/  (optional reuse)"
@@ -253,28 +273,72 @@ copy_frcnn_fx() {
   fi
 }
 
-if [ "$DATASET" = voc ]; then
-  copy_voc_images
-else
-  copy_bdd_images
-fi
+copy_gt_index() {
+  local dest="$DEST/data/id/gt_${DATASET}.json"
+  if [ -f "$dest" ]; then
+    echo "ok gt_${DATASET}.json (already at $dest)"
+    copied=$((copied + 1))
+    return
+  fi
+  local src
+  for src in \
+    "$EXP_DIR/gt_${DATASET}.json" \
+    "$EXP_DIR/gt.json" \
+    "$ARCH_DIR/gt_${DATASET}.json" \
+    "$SHARED/datasets/id/${DATASET}/gt_${DATASET}.json" \
+    "$SHARED/datasets/id/${DATASET}/gt.json"
+  do
+    if [ -f "$src" ]; then
+      copy_as "$src" "$dest"
+      return
+    fi
+  done
+  echo "no gt_${DATASET}.json on Drive; need local $dest (run.py stage A) for TP-filtered SPK eval"
+  if [ "$EVAL_ONLY" -eq 1 ]; then
+    missing=$((missing + 1))
+  fi
+}
 
-if [ "$DETECTOR" = yolo ]; then
-  copy "$SHARED/models/yolo/${DATASET}_vanilla.pt"             "$MODEL_DIR/"
-elif [ "$DETECTOR" = rtdetr ]; then
-  copy "$SHARED/models/rtdetr/${DATASET}_vanilla.pt"           "$MODEL_DIR/"
-else
-  copy "$SHARED/models/faster_rcnn/${DATASET}_vanilla.pth"     "$MODEL_DIR/"
-  copy_frcnn_fx
-fi
+if [ "$EVAL_ONLY" -eq 0 ]; then
+  if [ "$DATASET" = voc ]; then
+    copy_voc_images
+  else
+    copy_bdd_images
+  fi
 
-copy_first "$ARCH_DIR/training_data.pt" \
-  "$SEMANTIC/${DETECTOR}-${DATASET}.pt" \
-  "$SEMANTIC/${DETECTOR}_${DATASET}.pt"
+  if [ "$DETECTOR" = yolo ]; then
+    copy "$SHARED/models/yolo/${DATASET}_vanilla.pt"             "$MODEL_DIR/"
+  elif [ "$DETECTOR" = rtdetr ]; then
+    copy "$SHARED/models/rtdetr/${DATASET}_vanilla.pt"           "$MODEL_DIR/"
+  else
+    copy "$SHARED/models/faster_rcnn/${DATASET}_vanilla.pth"     "$MODEL_DIR/"
+    copy_frcnn_fx
+  fi
+
+  copy_first "$ARCH_DIR/training_data.pt" \
+    "$SEMANTIC/${DETECTOR}-${DATASET}.pt" \
+    "$SEMANTIC/${DETECTOR}_${DATASET}.pt"
+else
+  echo "eval-only: skip images, detector weights, and training_data.pt"
+fi
 
 echo
 reuse_stages=""
-if [ -d "$EXP_DIR" ]; then
+if [ "$EVAL_ONLY" -eq 1 ]; then
+  src="$EXP_DIR/concept_head_ood"
+  if [ -d "$src" ]; then
+    src=$(unwrap_stage_src "$src" "concept_head_ood")
+    copy_tree "$src" "$ARCH_DIR/concept_head_ood"
+    reuse_stages="concept_head_ood"
+  elif [ -d "$ARCH_DIR/concept_head_ood" ]; then
+    echo "ok concept_head_ood (already at $ARCH_DIR/concept_head_ood)"
+    reuse_stages="concept_head_ood"
+    copied=$((copied + 1))
+  else
+    echo "MISSING $EXP_DIR/concept_head_ood (and no local $ARCH_DIR/concept_head_ood)"
+    missing=$((missing + 1))
+  fi
+elif [ -d "$EXP_DIR" ]; then
   echo "reusing experiment caches from $EXP_DIR"
   for stage in roi native_knn concept_head_ood; do
     src="$EXP_DIR/$stage"
@@ -290,9 +354,10 @@ else
   echo "skip experiment reuse (no $EXP_DIR); run.py will build roi/native_knn/concept_head_ood"
 fi
 
+copy_gt_index
+
 echo
-echo "gt_{dataset}.json is not copied; run.py stage A builds $DEST/data/id/gt_${DATASET}.json from train tars"
-if [ ! -f "$ARCH_DIR/training_data.pt" ]; then
+if [ "$EVAL_ONLY" -eq 0 ] && [ ! -f "$ARCH_DIR/training_data.pt" ]; then
   echo "MISSING $ARCH_DIR/training_data.pt (need a file, not a directory)"
   missing=$((missing + 1))
 fi
@@ -302,6 +367,10 @@ if [ -n "$reuse_stages" ]; then
 else
   echo "outputs    -> $ARCH_DIR/{roi,native_knn,concept_head_ood}/  (created by run.py)"
 fi
+echo "gt         -> $DEST/data/id/gt_${DATASET}.json"
+echo
+echo "SPK baselines eval (after MOUNT_DATA_OK):"
+echo "  python eval_spk_baselines.py --detector $DETECTOR --dataset $DATASET"
 echo
 du -sh "$DEST"
 echo "copied $copied file(s), missing=$missing"

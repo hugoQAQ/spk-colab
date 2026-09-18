@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Run BAM / KNN / MDS on SPK activation features (from activations.csv).
+"""SPK-feature OOD baselines (MDS / BAM / KNN / Isolation Forest).
 
-Uses ood_baseline.fit_model / score / metrics with SPK feature vectors instead of
-detector logits.  Training defaults to ID-train true positives (IoU >= 0.5), matching
-run.py concept-head evaluation.
+Typical Colab flow:
 
-Example (YOLO VOC on Colab):
-  python eval_spk_baselines.py \\
-    --activations /content/spk/data/yolo/voc/concept_head_ood/activations.csv \\
-    --gt-index /content/spk/data/id/gt_voc.json \\
-    --out /content/spk/data/yolo/voc/spk_baselines
+  DETECTOR=yolo DATASET=bdd bash mount_data.sh
+  python eval_spk_baselines.py --detector yolo --dataset bdd
+
+Paths default to ``<root>/data/{detector}/{dataset}/``:
+  concept_head_ood/seed_*/activations.csv  (or a flat activations.csv)
+  -> spk_baselines/
+GT index: ``<root>/data/id/gt_{dataset}.json`` (built by run.py stage A).
 """
 from __future__ import annotations
 
@@ -30,7 +30,8 @@ SPK4 = ["known_max", "unknown", "proxy_max", "relative_area"]
 SPK_FULL = SPK4 + ["native_knn"]
 SPK_METHODS = ["MDS", "BAM", "KNN", "iForest"]
 DISPLAY_NAME = {"MDS": "SPK MDS", "BAM": "SPK BAM", "KNN": "SPK KNN", "iForest": "SPK IF"}
-SEEDS = (42, 43, 44)
+SEEDS = (42,)
+DEFAULT_ROOT = Path("/content/spk")
 
 SPLIT_MAP = {
     "id_train": "train",
@@ -55,7 +56,15 @@ def keep_true_positives(frame: pd.DataFrame, gt_index_path: Path) -> pd.DataFram
     for class_name, file_name, x1, y1, x2, y2 in frame[
         ["class", "file_name", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2"]
     ].to_numpy():
-        candidates = ground_truth.get(Path(file_name).stem, [])
+        raw = str(file_name)
+        stem = Path(raw).stem
+        name = Path(raw).name
+        alt = name.rsplit("_", 1)[-1] if name.startswith("train_") and name.count("_") >= 2 else name
+        candidates = (
+            ground_truth.get(stem)
+            or ground_truth.get(Path(alt).stem)
+            or []
+        )
         best = max(
             (iou([x1, y1, x2, y2], gt["bbox_xyxy"]) for gt in candidates if gt["class"] == class_name),
             default=0.0,
@@ -143,23 +152,66 @@ def load_spk_splits(args: argparse.Namespace, activations_path: Path) -> tuple[d
     return data, class_names
 
 
+def discover_seed_csvs(head_dir: Path) -> list[tuple[int, Path]]:
+    jobs = []
+    for directory in sorted(head_dir.glob("seed_*")):
+        csv_path = directory / "activations.csv"
+        if not csv_path.is_file():
+            continue
+        try:
+            seed = int(directory.name.split("_", 1)[1])
+        except ValueError:
+            continue
+        jobs.append((seed, csv_path))
+    return jobs
+
+
+def resolve_bundle(args: argparse.Namespace) -> None:
+    """Fill activations / seed-root / gt / out from --detector --dataset --root."""
+    if args.detector or args.dataset:
+        if not args.detector or not args.dataset:
+            raise SystemExit("pass both --detector and --dataset (or explicit --activations/--out)")
+        root = args.root.expanduser().resolve()
+        arch = root / "data" / args.detector / args.dataset
+        head = arch / "concept_head_ood"
+        if args.gt_index is None:
+            args.gt_index = root / "data" / "id" / f"gt_{args.dataset}.json"
+        if args.out is None:
+            args.out = arch / "spk_baselines"
+        if args.seed_root is None and args.activations is None:
+            seeded = discover_seed_csvs(head)
+            flat = head / "activations.csv"
+            if seeded:
+                args.seed_root = head
+            elif flat.is_file():
+                args.activations = flat
+            else:
+                raise SystemExit(
+                    f"no activations under {head} (need seed_*/activations.csv or activations.csv). "
+                    f"Mount with DETECTOR={args.detector} DATASET={args.dataset} bash mount_data.sh "
+                    "after run.py stage C, or copy concept_head_ood from Drive experiments."
+                )
+    if args.gt_index is None:
+        args.gt_index = DEFAULT_ROOT / "data/id/gt_voc.json"
+    if args.out is None:
+        raise SystemExit("need --out, or --detector and --dataset")
+    print(
+        f"detector={args.detector or '-'}  dataset={args.dataset or '-'}  root={args.root}\n"
+        f"  gt={args.gt_index}\n"
+        f"  activations={args.seed_root or args.activations}\n"
+        f"  out={args.out}",
+        flush=True,
+    )
+
+
 def seed_jobs(args: argparse.Namespace) -> list[tuple[int, Path]]:
     if args.seed_root is not None:
-        jobs = []
-        for directory in sorted(args.seed_root.glob("seed_*")):
-            csv_path = directory / "activations.csv"
-            if not csv_path.is_file():
-                continue
-            try:
-                seed = int(directory.name.split("_", 1)[1])
-            except ValueError:
-                continue
-            jobs.append((seed, csv_path))
+        jobs = discover_seed_csvs(args.seed_root)
         if not jobs:
             raise SystemExit(f"no seed_*/activations.csv under {args.seed_root}")
         return jobs
     if args.activations is None:
-        raise SystemExit("need --activations or --seed-root")
+        raise SystemExit("need --detector/--dataset, --activations, or --seed-root")
     return [(int(seed), args.activations) for seed in args.seeds]
 
 
@@ -259,7 +311,7 @@ def run_eval(args: argparse.Namespace) -> int:
             writer.writeheader()
             writer.writerows(rows)
 
-    print("\n=== 3-seed mean ± std (outlier removal: none) ===", flush=True)
+    print(f"\n=== {len(jobs)}-seed mean ± std (outlier removal: none) ===", flush=True)
     header = f"{'method':10s} {'near FPR95':14s} {'far FPR95':14s} {'near AUROC':14s} {'far AUROC':14s}"
     print(header, flush=True)
     pooled_rows = []
@@ -291,11 +343,15 @@ def run_eval(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--detector", choices=("yolo", "frcnn", "rtdetr"), default=None)
+    parser.add_argument("--dataset", choices=("voc", "bdd"), default=None)
+    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT,
+                        help="Bundle root (default: /content/spk)")
     parser.add_argument("--activations", type=Path, default=None)
     parser.add_argument("--seed-root", type=Path, default=None,
-                        help="concept_head_ood dir with seed_*/activations.csv (one eval seed per head seed)")
-    parser.add_argument("--gt-index", type=Path, default=Path("/content/spk/data/id/gt_voc.json"))
-    parser.add_argument("--out", type=Path, required=True)
+                        help="concept_head_ood dir with seed_*/activations.csv")
+    parser.add_argument("--gt-index", type=Path, default=None)
+    parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--features", nargs="+", choices=["known_max", "unknown", "proxy_max", "relative_area", "native_knn"],
                         default=SPK_FULL, help="SPK feature columns (default: spk full 5D)")
     parser.add_argument("--methods", nargs="+", choices=["BAM", "KNN", "MDS", "iForest"],
@@ -308,14 +364,15 @@ def main() -> int:
     parser.add_argument("--knn-k", type=int, default=5)
     parser.add_argument("--covariance", choices=["empirical", "ledoit-wolf"], default="empirical")
     parser.add_argument("--max-train-per-class", type=int, default=0)
-    parser.add_argument("--seed", type=int, default=None, help="Deprecated: use --seeds")
+    parser.add_argument("--seed", type=int, default=None, help="Single seed when using one activations.csv")
     parser.add_argument("--seeds", nargs="+", type=int, default=list(SEEDS),
-                        help="RNG seeds for BAM / iForest (default: 42 43 44)")
+                        help="Seeds when scoring one activations.csv (default: 42)")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=512)
     args = parser.parse_args()
     if args.seed is not None:
         args.seeds = [args.seed]
+    resolve_bundle(args)
     with threadpool_limits(limits=args.jobs):
         return run_eval(args)
 
