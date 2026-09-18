@@ -7,7 +7,7 @@ Typical Colab flow:
   python eval_spk_baselines.py --detector yolo --dataset bdd
 
 Paths default to ``<root>/data/{detector}/{dataset}/``:
-  concept_head_ood/seed_*/activations.csv  (or a flat activations.csv)
+  concept_head_ood/seed_42/activations.csv  (or a flat activations.csv)
   -> spk_baselines/
 GT index: ``<root>/data/id/gt_{dataset}.json`` (built by run.py stage A).
 """
@@ -152,17 +152,14 @@ def load_spk_splits(args: argparse.Namespace, activations_path: Path) -> tuple[d
     return data, class_names
 
 
-def discover_seed_csvs(head_dir: Path) -> list[tuple[int, Path]]:
+def discover_seed_csvs(head_dir: Path, seeds: list[int] | None = None) -> list[tuple[int, Path]]:
+    """Return activations for requested seeds only (default: 42)."""
+    wanted = list(seeds) if seeds is not None else list(SEEDS)
     jobs = []
-    for directory in sorted(head_dir.glob("seed_*")):
-        csv_path = directory / "activations.csv"
-        if not csv_path.is_file():
-            continue
-        try:
-            seed = int(directory.name.split("_", 1)[1])
-        except ValueError:
-            continue
-        jobs.append((seed, csv_path))
+    for seed in wanted:
+        csv_path = head_dir / f"seed_{seed}" / "activations.csv"
+        if csv_path.is_file():
+            jobs.append((int(seed), csv_path))
     return jobs
 
 
@@ -179,15 +176,16 @@ def resolve_bundle(args: argparse.Namespace) -> None:
         if args.out is None:
             args.out = arch / "spk_baselines"
         if args.seed_root is None and args.activations is None:
-            seeded = discover_seed_csvs(head)
+            seeded = discover_seed_csvs(head, args.seeds)
             flat = head / "activations.csv"
             if seeded:
                 args.seed_root = head
             elif flat.is_file():
                 args.activations = flat
             else:
+                need = ", ".join(f"seed_{s}/activations.csv" for s in args.seeds)
                 raise SystemExit(
-                    f"no activations under {head} (need seed_*/activations.csv or activations.csv). "
+                    f"no activations under {head} (need {need} or activations.csv). "
                     f"Mount with DETECTOR={args.detector} DATASET={args.dataset} bash mount_data.sh "
                     "after run.py stage C, or copy concept_head_ood from Drive experiments."
                 )
@@ -206,9 +204,10 @@ def resolve_bundle(args: argparse.Namespace) -> None:
 
 def seed_jobs(args: argparse.Namespace) -> list[tuple[int, Path]]:
     if args.seed_root is not None:
-        jobs = discover_seed_csvs(args.seed_root)
+        jobs = discover_seed_csvs(args.seed_root, args.seeds)
         if not jobs:
-            raise SystemExit(f"no seed_*/activations.csv under {args.seed_root}")
+            need = ", ".join(f"seed_{s}/activations.csv" for s in args.seeds)
+            raise SystemExit(f"no {need} under {args.seed_root}")
         return jobs
     if args.activations is None:
         raise SystemExit("need --detector/--dataset, --activations, or --seed-root")
@@ -349,7 +348,7 @@ def main() -> int:
                         help="Bundle root (default: /content/spk)")
     parser.add_argument("--activations", type=Path, default=None)
     parser.add_argument("--seed-root", type=Path, default=None,
-                        help="concept_head_ood dir with seed_*/activations.csv")
+                        help="concept_head_ood dir; uses seed_42/activations.csv only")
     parser.add_argument("--gt-index", type=Path, default=None)
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--features", nargs="+", choices=["known_max", "unknown", "proxy_max", "relative_area", "native_knn"],
@@ -366,7 +365,7 @@ def main() -> int:
     parser.add_argument("--max-train-per-class", type=int, default=0)
     parser.add_argument("--seed", type=int, default=None, help="Single seed when using one activations.csv")
     parser.add_argument("--seeds", nargs="+", type=int, default=list(SEEDS),
-                        help="Seeds when scoring one activations.csv (default: 42)")
+                        help="Which seed_* dirs / RNG seeds to use (default: 42 only)")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=512)
     args = parser.parse_args()
