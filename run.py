@@ -24,6 +24,7 @@ Examples
 --------
     DETECTOR=yolo DATASET=voc bash mount_data.sh
     python run.py --root /content/spk --detector yolo --dataset voc
+    python run.py --root /content/spk --detector yolo --dataset voc --stage A
     python run.py --root /content/spk --detector yolo --dataset voc --seeds 42 43 44
 
     DETECTOR=yolo DATASET=bdd bash mount_data.sh
@@ -2947,8 +2948,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", type=Path, default=None,
                         help="Stage C output dir (default: <root>/data/concept_head_ood)")
     parser.add_argument("--force", action="store_true", help="Re-extract ROI caches that already exist")
+    parser.add_argument(
+        "--stage",
+        nargs="+",
+        choices=("A", "B", "C"),
+        default=None,
+        help="Run only these stages (default: A B C). Example: --stage A builds gt_{dataset}.json only",
+    )
     parser.add_argument("--extract-only", action="store_true",
-                        help="Stop after stage B (ROI extraction); skip concept-head training")
+                        help="Stop after stage B (ROI extraction); same as --stage A B")
     parser.add_argument("--with-native", action="store_true",
                         help="Also write native-kNN image embeddings (needed for `spk global` / `spk full`)")
     parser.add_argument("--with-prior", action="store_true",
@@ -2992,6 +3000,14 @@ def parse_args() -> argparse.Namespace:
         set_root(args.root)
     else:
         refresh_paths()
+    if args.extract_only and args.stage is not None:
+        raise SystemExit("pass --stage or --extract-only, not both")
+    if args.extract_only:
+        args.stages = ["A", "B"]
+    elif args.stage is not None:
+        args.stages = [str(s).upper() for s in args.stage]
+    else:
+        args.stages = ["A", "B", "C"]
     if args.splits is None:
         args.splits = list(SPLITS)
     else:
@@ -3014,14 +3030,21 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    args.out_root.mkdir(parents=True, exist_ok=True)
-    migrate_legacy_heads(args.out_root, args.seeds[0])
+    stages = set(args.stages)
+    run_a = "A" in stages
+    run_b = "B" in stages
+    run_c = "C" in stages
 
-    if not CHECKPOINT.is_file():
-        raise FileNotFoundError(CHECKPOINT)
-    if PROFILE.detector == "frcnn" and not FRCNN_CFG.is_file():
-        raise FileNotFoundError(FRCNN_CFG)
-    if not resolve_training_data(TRAINING_DATA).is_file():
+    if run_c:
+        args.out_root.mkdir(parents=True, exist_ok=True)
+        migrate_legacy_heads(args.out_root, args.seeds[0])
+
+    if run_b:
+        if not CHECKPOINT.is_file():
+            raise FileNotFoundError(CHECKPOINT)
+        if PROFILE.detector == "frcnn" and not FRCNN_CFG.is_file():
+            raise FileNotFoundError(FRCNN_CFG)
+    if run_c and not resolve_training_data(TRAINING_DATA).is_file():
         raise FileNotFoundError(TRAINING_DATA)
 
     args.extract_batch_resolved = int(args.extract_batch) if args.extract_batch > 0 else 0
@@ -3029,9 +3052,11 @@ def main() -> None:
     args._knn_tables = None
     print(
         f"detector={PROFILE.detector}  dataset={PROFILE.name}  root={ROOT}\n"
+        f"  stages={args.stages}\n"
         f"  checkpoint={CHECKPOINT}\n"
         f"  training={TRAINING_DATA}\n"
         f"  roi={ROI_DIR}\n"
+        f"  gt={GT_INDEX}\n"
         f"  out={args.out_root}/seed_{{s}}\n"
         f"  max_det={PROFILE.max_det}  roi_ch={PROFILE.feature_channels}  "
         f"vram_frac={args.vram_frac:.0%}  seeds={list(args.seeds)}",
@@ -3053,49 +3078,54 @@ def main() -> None:
             "  assets gt publish disabled (use --assets-dir or mount Drive; --no-backup to silence)",
             flush=True,
         )
-    print_skip_plan(args)
+    if run_b or run_c:
+        print_skip_plan(args)
     t_all = time.perf_counter()
     timings: dict[str, float] = {}
 
-    print("=== [A] GT index ===")
-    t0 = time.perf_counter()
-    if gt_index_is_current(GT_INDEX, DATASET_DIR):
-        print(f"  {GT_INDEX} matches {PROFILE.name} ID-train, skipping")
-    else:
-        if GT_INDEX.is_file():
-            print(f"  {GT_INDEX} exists but does not match {PROFILE.name} ID-train; rebuilding")
-        build_gt_index(DATASET_DIR, GT_INDEX)
-    timings["A_gt_index"] = time.perf_counter() - t0
-    print(f"  stage A wall {_fmt_duration(timings['A_gt_index'])}")
-    if experiments_root is not None:
-        backup_gt_index(experiments_root)
-    if assets_shared_root is not None:
-        publish_gt_index_to_assets(assets_shared_root)
+    if run_a:
+        print("=== [A] GT index ===")
+        t0 = time.perf_counter()
+        if gt_index_is_current(GT_INDEX, DATASET_DIR):
+            print(f"  {GT_INDEX} matches {PROFILE.name} ID-train, skipping")
+        else:
+            if GT_INDEX.is_file():
+                print(f"  {GT_INDEX} exists but does not match {PROFILE.name} ID-train; rebuilding")
+            build_gt_index(DATASET_DIR, GT_INDEX)
+        timings["A_gt_index"] = time.perf_counter() - t0
+        print(f"  stage A wall {_fmt_duration(timings['A_gt_index'])}")
+        if experiments_root is not None:
+            backup_gt_index(experiments_root)
+        if assets_shared_root is not None:
+            publish_gt_index_to_assets(assets_shared_root)
 
-    print("=== [B] ROI extraction ===")
-    t0 = time.perf_counter()
-    engine = None
-    summaries = []
-    for split in args.splits:
-        # 只有需要重新提取时才加载模型；已有缓存由 extract_split 直接复用。
-        if any(split_needs_extract(split, args)) and engine is None:
-            engine = build_engine(args.device)
-            _ensure_extract_batch(engine, args)
-        summaries.append(extract_split(split, engine, args))
-    del engine
-    timings["B_roi_extract"] = time.perf_counter() - t0
-    summary_path = write_extraction_summary(summaries, timings["B_roi_extract"])
-    print(f"  wrote {summary_path}")
-    print(f"  stage B wall {_fmt_duration(timings['B_roi_extract'])}")
-    if experiments_root is not None:
-        backup_roi(experiments_root)
-        backup_native_knn(experiments_root)
+    if run_b:
+        print("=== [B] ROI extraction ===")
+        t0 = time.perf_counter()
+        engine = None
+        summaries = []
+        for split in args.splits:
+            # 只有需要重新提取时才加载模型；已有缓存由 extract_split 直接复用。
+            if any(split_needs_extract(split, args)) and engine is None:
+                engine = build_engine(args.device)
+                _ensure_extract_batch(engine, args)
+            summaries.append(extract_split(split, engine, args))
+        del engine
+        timings["B_roi_extract"] = time.perf_counter() - t0
+        summary_path = write_extraction_summary(summaries, timings["B_roi_extract"])
+        print(f"  wrote {summary_path}")
+        print(f"  stage B wall {_fmt_duration(timings['B_roi_extract'])}")
+        if experiments_root is not None:
+            backup_roi(experiments_root)
+            backup_native_knn(experiments_root)
 
-    if args.extract_only:
+    if not run_c:
         timings["total"] = time.perf_counter() - t_all
         print("\n=== wall-clock ===")
-        print(f"  A  GT index        {_fmt_duration(timings['A_gt_index'])}")
-        print(f"  B  ROI extract     {_fmt_duration(timings['B_roi_extract'])}")
+        if run_a:
+            print(f"  A  GT index        {_fmt_duration(timings['A_gt_index'])}")
+        if run_b:
+            print(f"  B  ROI extract     {_fmt_duration(timings['B_roi_extract'])}")
         print(f"  total              {_fmt_duration(timings['total'])}")
         return
 
@@ -3121,8 +3151,10 @@ def main() -> None:
         write_seed_pool(args.out_root, seed_reports)
 
     print("\n=== wall-clock ===")
-    print(f"  A  GT index        {_fmt_duration(timings['A_gt_index'])}")
-    print(f"  B  ROI extract     {_fmt_duration(timings['B_roi_extract'])}")
+    if run_a:
+        print(f"  A  GT index        {_fmt_duration(timings['A_gt_index'])}")
+    if run_b:
+        print(f"  B  ROI extract     {_fmt_duration(timings['B_roi_extract'])}")
     for seed in args.seeds:
         print(f"  C  seed {seed}        {_fmt_duration(seed_times[f'C_seed_{seed}'])}")
     print(f"  C  train+eval      {_fmt_duration(timings['C_train_eval'])}")
