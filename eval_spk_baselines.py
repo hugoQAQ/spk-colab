@@ -30,6 +30,8 @@ SPK4 = ["known_max", "unknown", "proxy_max", "relative_area"]
 SPK_FULL = SPK4 + ["native_knn"]
 SPK_METHODS = ["MDS", "BAM", "KNN", "iForest"]
 DISPLAY_NAME = {"MDS": "SPK MDS", "BAM": "SPK BAM", "KNN": "SPK KNN", "iForest": "SPK IF"}
+SEEDS = (42,)
+DEFAULT_ROOT = Path("/content/spk")
 DEFAULT_BAM_DENSITY_SWEEP = (1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0)
 
 SPLIT_MAP = {
