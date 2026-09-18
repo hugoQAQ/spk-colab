@@ -20,7 +20,7 @@
 #   bash mount_data.sh --detector yolo --dataset bdd --eval-only
 #     copies concept_head_ood (+ gt json if found); skip images/weights
 # Then:
-#   python eval_spk_baselines.py --detector yolo --dataset bdd
+#   python run.py --detector yolo --dataset bdd --stage D
 #
 # Expects on Drive (under MyDrive/assets/):
 #   shared/models/yolo/{voc,bdd}_vanilla.pt
@@ -59,7 +59,7 @@ while [ $# -gt 0 ]; do
     -h|--help)
       echo "Usage: $0 [--detector yolo|frcnn|rtdetr] [--dataset voc|bdd] [--eval-only] [--dest /content/spk]"
       echo "  or: DETECTOR=yolo DATASET=bdd $0"
-      echo "SPK eval after mount: python eval_spk_baselines.py --detector \$DETECTOR --dataset \$DATASET"
+      echo "SPK eval after mount: python run.py --detector \$DETECTOR --dataset \$DATASET --stage D"
       exit 0
       ;;
     *)
@@ -371,7 +371,7 @@ fi
 echo "gt         -> $DEST/data/id/gt_${DATASET}.json"
 echo
 echo "SPK baselines eval (after MOUNT_DATA_OK):"
-echo "  python eval_spk_baselines.py --detector $DETECTOR --dataset $DATASET"
+echo "  python run.py --detector $DETECTOR --dataset $DATASET --stage D"
 echo
 du -sh "$DEST"
 echo "copied $copied file(s), missing=$missing"

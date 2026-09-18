@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Concept-head OOD experiment (YOLO, Faster R-CNN, or RT-DETR; VOC or BDD).
 
-Three stages, run in order:
+Four stages, run in order:
 
   A  GT INDEX   decode YOLO `.txt` labels in ID-train tars -> data/id/gt_{voc,bdd}.json
   B  EXTRACT    one detector forward per image; cache float8 ROI features
@@ -10,6 +10,8 @@ Three stages, run in order:
   C  TRAIN+EVAL concept heads from data/{detector}/{dataset}/training_data.pt,
                 SPK4 + native kNN, classwise Isolation Forest
                 -> data/{detector}/{dataset}/concept_head_ood/seed_{seed}/
+  D  VARIANTS   MDS / BAM / KNN / iForest on SPK features -> spk_variants/
+                (runs after C by default; alone: --stage D)
 
 Default is one concept-head seed (42). Pass `--seeds 42 43 44` for a 3-seed
 run (stage A/B once; stage C retrains and rescores per seed, then mean±std).
@@ -24,7 +26,7 @@ Examples
 --------
     DETECTOR=yolo DATASET=voc bash mount_data.sh
     python run.py --root /content/spk --detector yolo --dataset voc
-    python run.py --root /content/spk --detector yolo --dataset voc --stage A
+    python run.py --root /content/spk --detector yolo --dataset voc --stage D
     python run.py --root /content/spk --detector yolo --dataset voc --seeds 42 43 44
 
     DETECTOR=yolo DATASET=bdd bash mount_data.sh
@@ -42,7 +44,7 @@ Examples
     # checkpoint: /content/spk/model/frcnn/voc_vanilla.pth
     # outputs:    /content/spk/data/frcnn/voc/concept_head_ood/
     # backups:    /content/drive/MyDrive/experiments/{detector}-{dataset}/
-    #             roi/  native_knn/  concept_head_ood/  gt_{dataset}.json
+    #             roi/  native_knn/  concept_head_ood/  gt_{dataset}.json  spk_variants/
     # assets:     /content/drive/MyDrive/assets/shared/datasets/id/{dataset}/gt_{dataset}.json
     #             (uploaded once when missing, for mount_data.sh --eval-only)
 """
@@ -59,10 +61,12 @@ import time
 import zipfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterator
 
 import cv2
 import numpy as np
+import ood_baseline
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -292,7 +296,7 @@ def set_root(root: Path) -> None:
 
 def refresh_paths() -> None:
     global CHECKPOINT, DATASET_DIR, OOD_DIR, ROI_DIR, GT_INDEX
-    global TRAINING_DATA, NATIVE_ROOT, PRIOR_DIR, FRCNN_CFG, ARCH_DIR
+    global TRAINING_DATA, NATIVE_ROOT, PRIOR_DIR, FRCNN_CFG, ARCH_DIR, SPK_VARIANTS_DIR
     CHECKPOINT = ROOT / "model" / PROFILE.detector / PROFILE.checkpoint
     DATASET_DIR = ROOT / "data/id"
     OOD_DIR = ROOT / "data/ood"
@@ -301,6 +305,7 @@ def refresh_paths() -> None:
     GT_INDEX = ROOT / "data/id" / f"gt_{PROFILE.name}.json"
     TRAINING_DATA = ARCH_DIR / "training_data.pt"
     NATIVE_ROOT = ARCH_DIR / "native_knn"
+    SPK_VARIANTS_DIR = ARCH_DIR / "spk_variants"
     PRIOR_DIR = ARCH_DIR / "detection_prior_rows"
     FRCNN_CFG = ROOT / PROFILE.frcnn_config
 
@@ -352,6 +357,7 @@ PRIOR_FIELDS = ["class", "data_source", "image_path", "file_name", "bbox_xyxy", 
 # for readability; the Isolation Forest treats them as an unordered feature set.
 SPK4_COLS = ["known_max", "unknown", "proxy_max", "relative_area"]
 KNN_COL = "native_knn"
+SPK_FULL_COLS = SPK4_COLS + [KNN_COL]
 NATIVE_K = 5
 ID_VAL_OUTLIER_FRACTION = 0.05
 
@@ -2404,6 +2410,10 @@ SEED = 42
 SEEDS = (42, 43, 44)
 CANONICAL_OUTLIER = "without_outlier_removal"
 LEGACY_HEAD_FILES = ("activations.csv", "results.json", "timing.json")
+SPK_VARIANT_METHODS = ("MDS", "BAM", "KNN", "iForest")
+SPK_VARIANT_LABELS = {"MDS": "SPK MDS", "BAM": "SPK BAM", "KNN": "SPK KNN", "iForest": "SPK IF"}
+BASELINE_SPLIT_MAP = {"id_train": "train", "id_val": "id_val", "near_ood": "near_ood", "far_ood": "far_ood"}
+DEFAULT_BAM_DENSITY_SWEEP = (1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0)
 EXPERIMENTS_DRIVE_DEFAULT = Path("/content/drive/MyDrive/experiments")
 ASSETS_SHARED_DRIVE_DEFAULT = Path("/content/drive/MyDrive/assets/shared")
 
@@ -2576,6 +2586,201 @@ def backup_concept_head_ood(experiments_root: Path, out_root: Path, seeds: list[
         )
     elif out_root.is_dir() and any(out_root.rglob("*")):
         print(f"  backup concept_head_ood: up to date at {dest}", flush=True)
+
+
+def default_bam_density() -> float:
+    return 50.0 if PROFILE.name == "bdd" else 5.0
+
+
+def variant_activation_jobs(args: argparse.Namespace) -> list[tuple[int, Path]]:
+    jobs: list[tuple[int, Path]] = []
+    flat = args.out_root / "activations.csv"
+    for seed in args.seeds:
+        path = seed_dir(args.out_root, seed) / "activations.csv"
+        if path.is_file():
+            jobs.append((int(seed), path))
+        elif len(args.seeds) == 1 and flat.is_file():
+            jobs.append((int(seed), flat))
+    if not jobs:
+        raise SystemExit(f"no activations.csv under {args.out_root} (run stage C first)")
+    return jobs
+
+
+def activations_to_baseline_data(
+    activations: pd.DataFrame, feature_cols: list[str], *, train_tp_only: bool = True,
+) -> dict[str, dict]:
+    missing = [c for c in feature_cols if c not in activations.columns]
+    if missing:
+        raise SystemExit(f"missing SPK columns in activations.csv: {missing}")
+    class_map = {name: i for i, name in enumerate(sorted(activations["class"].astype(str).unique()))}
+    data: dict[str, dict] = {}
+    for src, dst in BASELINE_SPLIT_MAP.items():
+        part = activations[activations["data_source"] == src].copy()
+        if dst == "train" and train_tp_only:
+            if not GT_INDEX.is_file():
+                raise SystemExit(f"GT index required for TP filter: {GT_INDEX}")
+            part = keep_true_positives(part, GT_INDEX)
+        part = part.loc[np.isfinite(part[feature_cols].to_numpy(dtype=np.float64)).all(axis=1)].copy()
+        if not len(part):
+            continue
+        x = part[feature_cols].to_numpy(dtype=np.float64)
+        labels = part["class"].astype(str).map(class_map).to_numpy(dtype=np.int64)
+        ids = (
+            part.index.astype(str) + ":" + part["class"].astype(str) + ":" + part["file_name"].astype(str)
+        ).to_numpy(dtype=str)
+        data[dst] = dict(logits=x, x=x, labels=labels, ids=ids, names=np.array(feature_cols, dtype=str))
+    if "train" not in data or not len(data["train"]["x"]):
+        raise SystemExit("empty train split after SPK variant filtering")
+    if "id_val" not in data or not len(data["id_val"]["x"]):
+        raise SystemExit("empty id_val split after SPK variant filtering")
+    return data
+
+
+def make_variant_args(args: argparse.Namespace, seed: int, bam_density: float | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        mds_labels="predicted",
+        covariance=args.variant_covariance,
+        knn_mode=args.variant_knn_mode,
+        knn_k=args.variant_knn_k,
+        bam_density=args.bam_density if bam_density is None else bam_density,
+        bam_max_boxes=256,
+        bam_cluster="minibatch",
+        iforest_scope="classwise",
+        trees=200,
+        iforest_samples=512,
+        seed=seed,
+        jobs=args.variant_jobs,
+        batch_size=512,
+        scale_percentile=65.0,
+        scale_degenerate="error",
+        msp_denominator="all",
+        msp_activation="softmax",
+        temperature=1.0,
+    )
+
+
+def _score_variant_method(
+    method: str, data: dict, train_x: np.ndarray, train_y: np.ndarray, baseline_args: SimpleNamespace,
+) -> dict[str, dict]:
+    eval_names = [k for k in data if k != "train"]
+    ood_splits = [k for k in eval_names if k != "id_val"]
+    model = ood_baseline.fit_model(method, train_x, train_y, baseline_args)
+    scores = {split: ood_baseline.score(method, model, data[split], baseline_args)[0] for split in eval_names}
+    return {split: ood_baseline.metrics(scores["id_val"], scores[split]) for split in ood_splits}
+
+
+def run_stage_d(args: argparse.Namespace) -> None:
+    """Stage D: MDS/BAM/KNN/iForest on saved activations -> spk_variants/."""
+    SPK_VARIANTS_DIR.mkdir(parents=True, exist_ok=True)
+    jobs = variant_activation_jobs(args)
+    feature_cols = list(args.spk_features)
+    if args.sweep_bam_density is not None:
+        densities = list(args.sweep_bam_density)
+        sweep_dir = SPK_VARIANTS_DIR / "bam_density_sweep"
+        sweep_dir.mkdir(parents=True, exist_ok=True)
+        rows: list[dict] = []
+        print(f"\n=== BAM density sweep ({len(feature_cols)}D) -> {sweep_dir} ===", flush=True)
+        for seed, path in jobs:
+            data = activations_to_baseline_data(pd.read_csv(path), feature_cols)
+            train_x, train_y = data["train"]["x"], data["train"]["labels"]
+            for density in densities:
+                try:
+                    metrics = _score_variant_method(
+                        "BAM", data, train_x, train_y, make_variant_args(args, seed, density),
+                    )
+                    near, far = metrics["near_ood"], metrics["far_ood"]
+                    rows.append({
+                        "seed": seed, "bam_density": float(density),
+                        "near_fpr95_pct": near["fpr95_pct"], "far_fpr95_pct": far["fpr95_pct"],
+                        "mean_fpr95_pct": float(np.mean([near["fpr95_pct"], far["fpr95_pct"]])),
+                        "near_auroc_pct": near["auroc_pct"], "far_auroc_pct": far["auroc_pct"],
+                    })
+                    print(
+                        f"  seed {seed} density={density:g}  near={near['fpr95_pct']:.2f}  "
+                        f"far={far['fpr95_pct']:.2f}",
+                        flush=True,
+                    )
+                except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
+                    print(f"  seed {seed} density={density:g}  FAILED: {exc}", flush=True)
+        if rows:
+            with open(sweep_dir / "sweep.csv", "w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+                writer.writeheader()
+                writer.writerows(rows)
+        return
+
+    methods = list(args.spk_variant_methods)
+    rows: list[dict] = []
+    report: dict[str, Any] = {
+        "feature_set": feature_cols, "train_tp_only": True, "outlier_removal": "none",
+        "jobs": [{"seed": s, "activations": str(p)} for s, p in jobs], "methods": {}, "errors": {},
+    }
+    by_method = {SPK_VARIANT_LABELS[m]: {} for m in methods}
+    print(f"\n=== SPK variants ({len(feature_cols)}D) -> {SPK_VARIANTS_DIR} ===", flush=True)
+    print(f"jobs={len(jobs)}  bam_density={args.bam_density}  knn_k={args.variant_knn_k}", flush=True)
+    for seed, path in jobs:
+        print(f"\n--- seed {seed} {path.name} ---", flush=True)
+        data = activations_to_baseline_data(pd.read_csv(path), feature_cols)
+        train_x, train_y = data["train"]["x"], data["train"]["labels"]
+        baseline_args = make_variant_args(args, seed)
+        eval_names = [k for k in data if k != "train"]
+        ood_splits = [k for k in eval_names if k != "id_val"]
+        for method in methods:
+            label = SPK_VARIANT_LABELS[method]
+            try:
+                model = ood_baseline.fit_model(method, train_x, train_y, baseline_args)
+                scores = {
+                    split: ood_baseline.score(method, model, data[split], baseline_args)[0]
+                    for split in eval_names
+                }
+                seed_result = {"evaluations": {"full_id": {}}}
+                for split in ood_splits:
+                    metrics = ood_baseline.metrics(scores["id_val"], scores[split])
+                    seed_result["evaluations"]["full_id"][split] = metrics
+                    rows.append(dict(method=label, seed=seed, protocol="full_id", split=split, **metrics))
+                    by_method[label].setdefault(split, {"fpr95_pct": [], "auroc_pct": []})
+                    if metrics.get("fpr95_pct") is not None:
+                        by_method[label][split]["fpr95_pct"].append(float(metrics["fpr95_pct"]))
+                    if metrics.get("auroc_pct") is not None:
+                        by_method[label][split]["auroc_pct"].append(float(metrics["auroc_pct"]))
+                report["methods"].setdefault(label, {})[str(seed)] = seed_result
+                print(f"  [{label}] ok", flush=True)
+            except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
+                report["errors"][f"{label}/seed{seed}"] = str(exc)
+                print(f"  [{label}] FAILED: {exc}", flush=True)
+
+    (SPK_VARIANTS_DIR / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    if rows:
+        with open(SPK_VARIANTS_DIR / "summary.csv", "w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+    pooled_rows = []
+    print(f"\n=== {len(jobs)}-seed mean ± std ===", flush=True)
+    header = f"{'method':10s} {'near FPR95':14s} {'far FPR95':14s} {'near AUROC':14s} {'far AUROC':14s}"
+    print(header, flush=True)
+    for method in methods:
+        label = SPK_VARIANT_LABELS[method]
+        near = by_method[label].get("near_ood", {"fpr95_pct": [], "auroc_pct": []})
+        far = by_method[label].get("far_ood", {"fpr95_pct": [], "auroc_pct": []})
+        print(
+            f"{label:10s} {_fmt_mean_std(near['fpr95_pct']):14s} {_fmt_mean_std(far['fpr95_pct']):14s} "
+            f"{_fmt_mean_std(near['auroc_pct']):14s} {_fmt_mean_std(far['auroc_pct']):14s}",
+            flush=True,
+        )
+        pooled_rows.append({
+            "method": label, "outlier_removal": "none",
+            "near_fpr95": _fmt_mean_std(near["fpr95_pct"]).strip(),
+            "far_fpr95": _fmt_mean_std(far["fpr95_pct"]).strip(),
+            "near_auroc": _fmt_mean_std(near["auroc_pct"]).strip(),
+            "far_auroc": _fmt_mean_std(far["auroc_pct"]).strip(),
+        })
+    (SPK_VARIANTS_DIR / "pooled_mean_std.json").write_text(json.dumps(pooled_rows, indent=2) + "\n")
+
+
+def backup_spk_variants(experiments_root: Path) -> None:
+    if SPK_VARIANTS_DIR.is_dir() and any(SPK_VARIANTS_DIR.rglob("*")):
+        _backup_stage(experiments_root, "spk_variants", SPK_VARIANTS_DIR, "spk_variants")
 
 
 def seed_dir(root: Path, seed: int) -> Path:
@@ -2951,12 +3156,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stage",
         nargs="+",
-        choices=("A", "B", "C"),
+        choices=("A", "B", "C", "D"),
         default=None,
-        help="Run only these stages (default: A B C). Example: --stage A builds gt_{dataset}.json only",
+        help="Run only these stages (default: A B C D). Example: --stage D runs SPK variant baselines only",
     )
     parser.add_argument("--extract-only", action="store_true",
                         help="Stop after stage B (ROI extraction); same as --stage A B")
+    parser.add_argument("--skip-spk-variants", action="store_true",
+                        help="Skip stage D (MDS/BAM/KNN/iForest on SPK features)")
+    parser.add_argument("--bam-density", type=float, default=None,
+                        help="Stage D BAM density (default: 5 voc, 50 bdd)")
+    parser.add_argument("--sweep-bam-density", nargs="*", type=float, default=None, metavar="D",
+                        help="Stage D: sweep BAM densities only (default grid: 1 2 3 5 10 20 50)")
+    parser.add_argument("--spk-features", nargs="+",
+                        choices=["known_max", "unknown", "proxy_max", "relative_area", "native_knn"],
+                        default=None, help="Stage D feature columns (default: 5D spk full)")
+    parser.add_argument("--spk-variant-methods", nargs="+", choices=list(SPK_VARIANT_METHODS),
+                        default=list(SPK_VARIANT_METHODS))
+    parser.add_argument("--variant-covariance", choices=["empirical", "ledoit-wolf"], default="empirical")
+    parser.add_argument("--variant-knn-mode", choices=["mhood", "sun"], default="mhood")
+    parser.add_argument("--variant-knn-k", type=int, default=5)
+    parser.add_argument("--variant-jobs", type=int, default=4,
+                        help="CPU threads for stage D sklearn baselines")
     parser.add_argument("--with-native", action="store_true",
                         help="Also write native-kNN image embeddings (needed for `spk global` / `spk full`)")
     parser.add_argument("--with-prior", action="store_true",
@@ -3007,7 +3228,15 @@ def parse_args() -> argparse.Namespace:
     elif args.stage is not None:
         args.stages = [str(s).upper() for s in args.stage]
     else:
-        args.stages = ["A", "B", "C"]
+        args.stages = ["A", "B", "C", "D"]
+    if args.skip_spk_variants and "D" in args.stages:
+        args.stages = [s for s in args.stages if s != "D"]
+    if args.bam_density is None:
+        args.bam_density = default_bam_density()
+    if args.spk_features is None:
+        args.spk_features = list(SPK_FULL_COLS)
+    if args.sweep_bam_density is not None and not args.sweep_bam_density:
+        args.sweep_bam_density = list(DEFAULT_BAM_DENSITY_SWEEP)
     if args.splits is None:
         args.splits = list(SPLITS)
     else:
@@ -3034,6 +3263,7 @@ def main() -> None:
     run_a = "A" in stages
     run_b = "B" in stages
     run_c = "C" in stages
+    run_d = "D" in stages
 
     if run_c:
         args.out_root.mkdir(parents=True, exist_ok=True)
@@ -3120,52 +3350,65 @@ def main() -> None:
             backup_native_knn(experiments_root)
 
     if not run_c:
-        timings["total"] = time.perf_counter() - t_all
-        print("\n=== wall-clock ===")
-        if run_a:
-            print(f"  A  GT index        {_fmt_duration(timings['A_gt_index'])}")
-        if run_b:
-            print(f"  B  ROI extract     {_fmt_duration(timings['B_roi_extract'])}")
-        print(f"  total              {_fmt_duration(timings['total'])}")
-        return
+        if not run_d:
+            timings["total"] = time.perf_counter() - t_all
+            print("\n=== wall-clock ===")
+            if run_a:
+                print(f"  A  GT index        {_fmt_duration(timings['A_gt_index'])}")
+            if run_b:
+                print(f"  B  ROI extract     {_fmt_duration(timings['B_roi_extract'])}")
+            print(f"  total              {_fmt_duration(timings['total'])}")
+            return
 
-    print("=== [C] concept heads + OOD eval ===")
-    t0 = time.perf_counter()
-    seed_reports: dict[int, dict] = {}
-    seed_times: dict[str, float] = {}
-    for seed in args.seeds:
-        args.seed = int(seed)
-        args.out = seed_dir(args.out_root, seed)
-        args.out.mkdir(parents=True, exist_ok=True)
-        seed_everything(seed)
-        print(f"\n----- seed {seed} -> {args.out} -----", flush=True)
-        t_seed = time.perf_counter()
-        seed_reports[seed] = train_and_eval(args)
-        seed_times[f"C_seed_{seed}"] = time.perf_counter() - t_seed
-        print(f"  seed {seed} wall {_fmt_duration(seed_times[f'C_seed_{seed}'])}", flush=True)
-    timings.update(seed_times)
-    timings["C_train_eval"] = time.perf_counter() - t0
+    if run_c:
+        print("=== [C] concept heads + OOD eval ===")
+        t0 = time.perf_counter()
+        seed_reports: dict[int, dict] = {}
+        seed_times: dict[str, float] = {}
+        for seed in args.seeds:
+            args.seed = int(seed)
+            args.out = seed_dir(args.out_root, seed)
+            args.out.mkdir(parents=True, exist_ok=True)
+            seed_everything(seed)
+            print(f"\n----- seed {seed} -> {args.out} -----", flush=True)
+            t_seed = time.perf_counter()
+            seed_reports[seed] = train_and_eval(args)
+            seed_times[f"C_seed_{seed}"] = time.perf_counter() - t_seed
+            print(f"  seed {seed} wall {_fmt_duration(seed_times[f'C_seed_{seed}'])}", flush=True)
+        timings.update(seed_times)
+        timings["C_train_eval"] = time.perf_counter() - t0
+        print(f"  stage C wall {_fmt_duration(timings['C_train_eval'])}")
+        if len(seed_reports) > 1:
+            write_seed_pool(args.out_root, seed_reports)
+        timing_path = args.out_root / "timing.json"
+        timing_path.write_text(json.dumps(timings, indent=2) + "\n")
+        print(f"wrote {timing_path}")
+        if experiments_root is not None:
+            backup_concept_head_ood(experiments_root, args.out_root, list(args.seeds))
+            backup_native_knn(experiments_root)
+
+    if run_d:
+        print("=== [D] SPK variants ===")
+        t0 = time.perf_counter()
+        run_stage_d(args)
+        timings["D_spk_variants"] = time.perf_counter() - t0
+        print(f"  stage D wall {_fmt_duration(timings['D_spk_variants'])}")
+        if experiments_root is not None:
+            backup_spk_variants(experiments_root)
+
     timings["total"] = time.perf_counter() - t_all
-    print(f"  stage C wall {_fmt_duration(timings['C_train_eval'])}")
-    if len(seed_reports) > 1:
-        write_seed_pool(args.out_root, seed_reports)
-
     print("\n=== wall-clock ===")
     if run_a:
-        print(f"  A  GT index        {_fmt_duration(timings['A_gt_index'])}")
+        print(f"  A  GT index        {_fmt_duration(timings.get('A_gt_index', 0.0))}")
     if run_b:
-        print(f"  B  ROI extract     {_fmt_duration(timings['B_roi_extract'])}")
-    for seed in args.seeds:
-        print(f"  C  seed {seed}        {_fmt_duration(seed_times[f'C_seed_{seed}'])}")
-    print(f"  C  train+eval      {_fmt_duration(timings['C_train_eval'])}")
+        print(f"  B  ROI extract     {_fmt_duration(timings.get('B_roi_extract', 0.0))}")
+    if run_c:
+        for seed in args.seeds:
+            print(f"  C  seed {seed}        {_fmt_duration(timings.get(f'C_seed_{seed}', 0.0))}")
+        print(f"  C  train+eval      {_fmt_duration(timings.get('C_train_eval', 0.0))}")
+    if run_d:
+        print(f"  D  spk variants    {_fmt_duration(timings.get('D_spk_variants', 0.0))}")
     print(f"  total              {_fmt_duration(timings['total'])}")
-
-    timing_path = args.out_root / "timing.json"
-    timing_path.write_text(json.dumps(timings, indent=2) + "\n")
-    print(f"wrote {timing_path}")
-    if experiments_root is not None:
-        backup_concept_head_ood(experiments_root, args.out_root, list(args.seeds))
-        backup_native_knn(experiments_root)
 
 
 if __name__ == "__main__":
