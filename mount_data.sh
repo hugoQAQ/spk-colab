@@ -7,7 +7,7 @@
 # tars and training_data.pt straight off Drive is far slower than one bulk copy.
 #
 # Layout under DEST=/content/spk:
-#   model/{yolo,frcnn}/{voc,bdd}_vanilla.{pt,pth}
+#   model/{yolo,frcnn,rtdetr}/{voc,bdd}_vanilla.{pt,pth}
 #   data/id , data/ood                          (shared image tars; gt.json is built by run.py)
 #   data/{detector}/{dataset}/training_data.pt
 #   data/{detector}/{dataset}/{roi,native_knn,concept_head_ood}/
@@ -18,14 +18,18 @@
 #   DETECTOR=yolo DATASET=voc bash mount_data.sh    # default
 #   DETECTOR=yolo DATASET=bdd bash mount_data.sh
 #   DETECTOR=frcnn DATASET=voc bash mount_data.sh
+#   DETECTOR=frcnn DATASET=bdd bash mount_data.sh
+#   DETECTOR=rtdetr DATASET=voc bash mount_data.sh
+#   DETECTOR=rtdetr DATASET=bdd bash mount_data.sh
 #
 # Expects on Drive (under MyDrive/assets/):
 #   shared/models/yolo/{voc,bdd}_vanilla.pt
-#   shared/models/faster_rcnn/voc_vanilla.pth
+#   shared/models/rtdetr/{voc,bdd}_vanilla.pt
+#   shared/models/faster_rcnn/{voc,bdd}_vanilla.pth
 #   shared/datasets/id/{voc,bdd}/...  (bdd train default: bdd_train_10k-*.tar)
 #   shared/datasets/ood/{near-ood-voc,near-ood-bdd,far-ood}/...
-#   semantic_training_data/yolo-voc.pt | yolo-bdd.pt | frcnn_voc.pt
-# Optional on Drive (under MyDrive/experiments/{yolo-voc,yolo-bdd,frcnn-voc}/):
+#   semantic_training_data/{detector}-{dataset}.pt  (also accepts {detector}_{dataset}.pt)
+# Optional on Drive (under MyDrive/experiments/{detector}-{dataset}/):
 #   roi/  native_knn/  concept_head_ood/
 # FRCNN also needs Detectron2 FX yaml+utils at one of:
 #   shared/models/faster_rcnn/fx/
@@ -45,9 +49,9 @@ DEST=/content/spk
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
 case "$DETECTOR" in
-  yolo|frcnn) ;;
+  yolo|frcnn|rtdetr) ;;
   *)
-    echo "unknown DETECTOR=$DETECTOR (use yolo or frcnn)"
+    echo "unknown DETECTOR=$DETECTOR (use yolo, frcnn, or rtdetr)"
     exit 2
     ;;
 esac
@@ -58,10 +62,6 @@ case "$DATASET" in
     exit 2
     ;;
 esac
-if [ "$DETECTOR" = frcnn ] && [ "$DATASET" != voc ]; then
-  echo "frcnn currently only supports DATASET=voc"
-  exit 2
-fi
 
 EXP_DIR="$EXPERIMENTS/${DETECTOR}-${DATASET}"
 
@@ -211,20 +211,8 @@ copy_bdd_images() {
   copy "$SHARED/datasets/ood/far-ood/far_ood-000000.tar"       "$DEST/data/ood/"
 }
 
-if [ "$DETECTOR" = yolo ] && [ "$DATASET" = voc ]; then
-  copy "$SHARED/models/yolo/voc_vanilla.pt"                    "$MODEL_DIR/"
-  copy_voc_images
-  copy_as "$SEMANTIC/yolo-voc.pt"                              "$ARCH_DIR/training_data.pt"
-elif [ "$DETECTOR" = yolo ] && [ "$DATASET" = bdd ]; then
-  copy "$SHARED/models/yolo/bdd_vanilla.pt"                    "$MODEL_DIR/"
-  copy_bdd_images
-  copy_as "$SEMANTIC/yolo-bdd.pt"                              "$ARCH_DIR/training_data.pt"
-else
-  copy "$SHARED/models/faster_rcnn/voc_vanilla.pth"            "$MODEL_DIR/"
-  copy_voc_images
-  copy_first "$ARCH_DIR/training_data.pt" \
-    "$SEMANTIC/frcnn_voc.pt" "$SEMANTIC/frcnn-voc.pt"
-  fx_src=""
+copy_frcnn_fx() {
+  local fx_src=""
   if [ -d "$SHARED/models/faster_rcnn/fx" ]; then
     fx_src="$SHARED/models/faster_rcnn/fx"
   elif [ -d "/content/frcnn_fx" ]; then
@@ -235,10 +223,38 @@ else
   if [ -z "$fx_src" ]; then
     echo "MISSING frcnn_fx (need Drive shared/models/faster_rcnn/fx, /content/frcnn_fx, or $HERE/frcnn_fx)"
     missing=$((missing + 1))
+  elif [ "$fx_src" = "$HERE/frcnn_fx" ] && [ ! -e "$MODEL_DIR/frcnn_fx" ]; then
+    echo
+    echo "==> frcnn_fx/ (bundled) -> symlink $MODEL_DIR/frcnn_fx"
+    ln -sfn "$fx_src" "$MODEL_DIR/frcnn_fx"
+    echo "ok frcnn_fx/ (symlink)"
+    copied=$((copied + 1))
+  elif [ "$fx_src" = "$HERE/frcnn_fx" ] && [ -L "$MODEL_DIR/frcnn_fx" ]; then
+    echo "ok frcnn_fx/ (existing symlink)"
+    copied=$((copied + 1))
   else
     copy_tree "$fx_src" "$MODEL_DIR/frcnn_fx"
   fi
+}
+
+if [ "$DATASET" = voc ]; then
+  copy_voc_images
+else
+  copy_bdd_images
 fi
+
+if [ "$DETECTOR" = yolo ]; then
+  copy "$SHARED/models/yolo/${DATASET}_vanilla.pt"             "$MODEL_DIR/"
+elif [ "$DETECTOR" = rtdetr ]; then
+  copy "$SHARED/models/rtdetr/${DATASET}_vanilla.pt"           "$MODEL_DIR/"
+else
+  copy "$SHARED/models/faster_rcnn/${DATASET}_vanilla.pth"     "$MODEL_DIR/"
+  copy_frcnn_fx
+fi
+
+copy_first "$ARCH_DIR/training_data.pt" \
+  "$SEMANTIC/${DETECTOR}-${DATASET}.pt" \
+  "$SEMANTIC/${DETECTOR}_${DATASET}.pt"
 
 echo
 reuse_stages=""
