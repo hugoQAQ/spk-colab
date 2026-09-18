@@ -29,7 +29,7 @@
 #   shared/datasets/id/{voc,bdd}/...  (bdd train default: bdd_train_10k-*.tar)
 #   shared/datasets/id/voc/gt_voc.json  (for eval-only SPK baselines; also gt_bdd.json)
 #   shared/datasets/ood/{near-ood-voc,near-ood-bdd,far-ood}/...
-#   semantic_training_data/{detector}-{dataset}.pt  (also accepts {detector}_{dataset}.pt)
+#   semantic_training_data/{detector}-{dataset}.pt  (flat files only; also {detector}_{dataset}.pt)
 # Optional on Drive (under MyDrive/experiments/{detector}-{dataset}/):
 #   roi/  native_knn/  concept_head_ood/
 # FRCNN also needs Detectron2 FX yaml+utils at one of:
@@ -107,18 +107,10 @@ copy_one() {
   local size dest landed
   dest_dir="${dest_dir%/}"
   mkdir -p "$dest_dir"
-  # Drive/rsync can land a folder named *.pt; flatten to the real file.
   if [ -d "$src" ]; then
-    local inner wanted
-    wanted=${dest_name:-$(basename "$src")}
-    inner=$(find "$src" -type f \( -name "$wanted" -o -name 'training_data.pt' -o -name '*.pt' -o -name '*.pth' \) | head -n 1)
-    if [ -z "$inner" ]; then
-      echo "MISSING $src (directory with no .pt inside)"
-      missing=$((missing + 1))
-      return
-    fi
-    echo "note: $src is a directory; using $inner"
-    src=$inner
+    echo "MISSING $src (expected a flat .pt file under semantic_training_data/, not a folder)"
+    missing=$((missing + 1))
+    return
   fi
   if [ ! -f "$src" ]; then
     echo "MISSING $src (not a file)"
