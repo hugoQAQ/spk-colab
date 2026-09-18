@@ -175,7 +175,7 @@ BDD_PROFILE = DatasetProfile(
     splits=("bdd_train", "bdd_val", "near_ood", "far_ood"),
     id_splits=frozenset({"bdd_train", "bdd_val"}),
     split_tar_prefix={
-        "bdd_train": "bdd_train",
+        "bdd_train": "bdd_train_10k",
         "bdd_val": "bdd_val",
         "near_ood": "near_ood",
         "far_ood": "far_ood",
@@ -206,7 +206,7 @@ BDD_PROFILE = DatasetProfile(
     },
     label_classes=tuple(BDD10),
     eval_classes=frozenset(BDD10),
-    gt_train_glob="bdd_train-*.tar",
+    gt_train_glob="bdd_train_10k-*.tar",
     gt_fixed_size=(1280, 720),
     roi_cache_type="bdd_fp8_roi_features",
     strip_train_prefix=True,
@@ -1651,7 +1651,11 @@ def train_head(class_name, x, y, groups, args) -> ConceptHead:
     for group_id, group in enumerate(groups):
         group_of_row[y[train_idx, group].flatten(1).sum(1) > 0] = group_id
     counts = torch.bincount(group_of_row, minlength=len(groups)).float().clamp_min(1)
-    sampler = WeightedRandomSampler(1.0 / counts[group_of_row], len(train_idx), replacement=True)
+    sampler_gen = torch.Generator()
+    sampler_gen.manual_seed(int(args.seed))
+    sampler = WeightedRandomSampler(
+        1.0 / counts[group_of_row], len(train_idx), replacement=True, generator=sampler_gen,
+    )
 
     head_batch = min(tune_head_batch(int(x.shape[1]), int(y.shape[1]), args), len(train_idx))
     train_loader = DataLoader(
@@ -1697,6 +1701,17 @@ def train_head(class_name, x, y, groups, args) -> ConceptHead:
 # Stage C-2: score the cached ROIs into SPK4 activations
 # ===========================================================================
 
+def canonical_pred_class(row: dict[str, Any]) -> str | None:
+    """Map detector/cache labels onto PROFILE / head names (e.g. pedestrian -> person)."""
+    raw = row.get("pred_class") or row.get("class") or row.get("detector_label")
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    lowered = text.lower()
+    aliased = PROFILE.label_aliases.get(lowered, PROFILE.label_aliases.get(text, text))
+    return aliased
+
+
 def score_roi_cache(
     cache_path: Path, split_name: str, heads: dict, device: str, batch_size: int = HEAD_BATCH,
 ) -> pd.DataFrame:
@@ -1705,10 +1720,18 @@ def score_roi_cache(
     metadata, fp8, scales = cache["metadata"], cache["features_fp8"], cache["scales"]
 
     rows_by_class: dict[str, list[int]] = {}
+    dropped: dict[str, int] = {}
     for i, row in enumerate(metadata):
-        predicted = row.get("pred_class") or row.get("class")
+        predicted = canonical_pred_class(row)
         if predicted in heads:
             rows_by_class.setdefault(predicted, []).append(i)
+        else:
+            dropped[str(predicted)] = dropped.get(str(predicted), 0) + 1
+    if dropped:
+        print(
+            f"  {split_name}: dropped {sum(dropped.values())} ROIs with no head {dropped}",
+            flush=True,
+        )
 
     torch_device = torch.device(device)
     records = []
@@ -1819,7 +1842,18 @@ def evaluate(
         near = split(activations[activations["data_source"] == "near_ood"])
         far = split(activations[activations["data_source"] == "far_ood"])
         if len(train) < 5 or len(id_val) < 5:
-            per_class[class_name] = {"skipped": True, "n_train": len(train), "n_id_val": len(id_val)}
+            per_class[class_name] = {
+                "skipped": True,
+                "n_train": len(train),
+                "n_id_val": len(id_val),
+                "n_near_ood": len(near),
+                "n_far_ood": len(far),
+            }
+            print(
+                f"  {class_name:8s} SKIPPED  n_train={len(train)} n_id_val={len(id_val)}  "
+                f"OOD near={len(near)} far={len(far)} excluded from FPR",
+                flush=True,
+            )
             continue
         if len(train) > 1500:  # cap keeps fitting fast; 1500 is plenty for 4-5 features
             train = train[np.random.default_rng(42).choice(len(train), 1500, replace=False)]
@@ -1851,7 +1885,11 @@ def evaluate(
             "near_fpr95": near_fpr, "far_fpr95": far_fpr,
             "mean_fpr95": float(np.nanmean([near_fpr, far_fpr])),
         }
-        print(f"  {class_name:8s} near={near_fpr:6.2f}  far={far_fpr:6.2f}", flush=True)
+        print(
+            f"  {class_name:8s} near={near_fpr:6.2f}  far={far_fpr:6.2f}  "
+            f"n_near={len(near)} n_far={len(far)}",
+            flush=True,
+        )
 
     # Pooled: concatenate the per-class IF scores, then one global threshold.
     cat = {name: np.concatenate(parts) if parts else np.zeros(0) for name, parts in pooled.items()}
@@ -2087,9 +2125,16 @@ def train_and_eval(args: argparse.Namespace) -> None:
                 ROI_DIR / filename, split_name, heads, args.device, batch_size=score_batch,
             )
             print(f"  {split_name}: {len(frame):,} ROIs", flush=True)
+            if not frame.empty:
+                print(f"    {frame['class'].value_counts().to_dict()}", flush=True)
             frames.append(frame)
         activations = pd.concat(frames, ignore_index=True)
         del heads
+        print(
+            "  scored class x split:\n"
+            f"{activations.groupby(['data_source', 'class']).size().unstack(fill_value=0)}",
+            flush=True,
+        )
 
     print("  ensuring image-level native embeddings")
     ensure_native_embeddings(args)
@@ -2117,6 +2162,7 @@ def train_and_eval(args: argparse.Namespace) -> None:
     report: dict[str, Any] = {
         "dataset": PROFILE.name,
         "detector": PROFILE.detector,
+        "seed": int(args.seed),
         "ood_protocol": "near_far_ood",
         "id_train_filter": "same predicted class and IoU >= 0.5 with ground truth",
         "native_knn": {
@@ -2273,6 +2319,8 @@ def main() -> None:
                         help="Stage B image batch; 0 = auto from --vram-frac")
     parser.add_argument("--head-batch", type=int, default=0,
                         help="Stage C head train/score batch; 0 = auto from --vram-frac")
+    parser.add_argument("--seed", type=int, default=SEED,
+                        help="RNG seed for concept-head training (default: 42)")
     args = parser.parse_args()
     set_profile(args.detector, args.dataset)
     if args.root is not None:
@@ -2291,9 +2339,10 @@ def main() -> None:
     if args.out is None:
         args.out = ARCH_DIR / "concept_head_ood"
 
-    torch.manual_seed(SEED)
-    np.random.seed(SEED)
-    args.seed = SEED
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     args.out.mkdir(parents=True, exist_ok=True)
 
     if not CHECKPOINT.is_file():
@@ -2312,7 +2361,7 @@ def main() -> None:
         f"  roi={ROI_DIR}\n"
         f"  out={args.out}\n"
         f"  max_det={PROFILE.max_det}  roi_ch={PROFILE.feature_channels}  "
-        f"vram_frac={args.vram_frac:.0%}",
+        f"vram_frac={args.vram_frac:.0%}  seed={args.seed}",
         flush=True,
     )
     print_skip_plan(args)

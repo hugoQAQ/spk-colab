@@ -22,7 +22,7 @@
 # Expects on Drive (under MyDrive/assets/):
 #   shared/models/yolo/{voc,bdd}_vanilla.pt
 #   shared/models/faster_rcnn/voc_vanilla.pth
-#   shared/datasets/id/{voc,bdd}/...
+#   shared/datasets/id/{voc,bdd}/...  (bdd train default: bdd_train_10k-*.tar)
 #   shared/datasets/ood/{near-ood-voc,near-ood-bdd,far-ood}/...
 #   semantic_training_data/yolo-voc.pt | yolo-bdd.pt | frcnn_voc.pt
 # Optional on Drive (under MyDrive/experiments/{yolo-voc,yolo-bdd,frcnn-voc}/):
@@ -209,7 +209,9 @@ if [ "$DETECTOR" = yolo ] && [ "$DATASET" = voc ]; then
   copy_as "$SEMANTIC/yolo-voc.pt"                              "$ARCH_DIR/training_data.pt"
 elif [ "$DETECTOR" = yolo ] && [ "$DATASET" = bdd ]; then
   copy "$SHARED/models/yolo/bdd_vanilla.pt"                    "$MODEL_DIR/"
-  copy "$SHARED/datasets/id/bdd/bdd_train-*.tar"               "$DEST/data/id/"
+  # Default BDD id-train: 10k subset tar (override with BDD_TRAIN_TAR=bdd_train-*.tar for full 30k)
+  BDD_TRAIN_TAR="${BDD_TRAIN_TAR:-bdd_train_10k-*.tar}"
+  copy "$SHARED/datasets/id/bdd/$BDD_TRAIN_TAR"                "$DEST/data/id/"
   copy "$SHARED/datasets/id/bdd/bdd_val-000000.tar"            "$DEST/data/id/"
   copy "$SHARED/datasets/ood/near-ood-bdd/near_ood-000000.tar" "$DEST/data/ood/"
   copy "$SHARED/datasets/ood/far-ood/far_ood-000000.tar"       "$DEST/data/ood/"
