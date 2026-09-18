@@ -102,7 +102,7 @@ DATASETS: dict[str, DatasetConfig] = {
         split_specs={
             "voc-train": {"prefix": "voc_yolo_train", "search": "id"},
             "voc-val": {"prefix": "voc_yolo_val", "search": "id"},
-            "near-ood": {"prefix": "near_ood", "search": "ood"},
+            "near-ood": {"prefix": "near_ood_voc", "search": "ood"},
             "far-ood": {"prefix": "far_ood", "search": "ood"},
         },
         label_aliases={
@@ -122,7 +122,7 @@ DATASETS: dict[str, DatasetConfig] = {
         split_specs={
             "bdd-train": {"prefix": "bdd_train_10k", "search": "id"},
             "bdd-val": {"prefix": "bdd_val", "search": "id"},
-            "near-ood": {"prefix": "near_ood", "search": "ood"},
+            "near-ood": {"prefix": "near_ood_bdd", "search": "ood"},
             "far-ood": {"prefix": "far_ood", "search": "ood"},
         },
         label_aliases={

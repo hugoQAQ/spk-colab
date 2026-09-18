@@ -135,7 +135,7 @@ VOC_PROFILE = DatasetProfile(
     split_tar_prefix={
         "voc_train": "voc_yolo_train",
         "voc_val": "voc_yolo_val",
-        "near_ood": "near_ood",
+        "near_ood": "near_ood_voc",
         "far_ood": "far_ood",
     },
     split_output_names={
@@ -177,7 +177,7 @@ BDD_PROFILE = DatasetProfile(
     split_tar_prefix={
         "bdd_train": "bdd_train_10k",
         "bdd_val": "bdd_val",
-        "near_ood": "near_ood",
+        "near_ood": "near_ood_bdd",
         "far_ood": "far_ood",
     },
     split_output_names={

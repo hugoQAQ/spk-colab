@@ -5,7 +5,8 @@
 #   model/frcnn/{voc,bdd}_vanilla.pth
 #   model/frcnn/frcnn_fx/          (Detectron2 FX yaml + utils; required to load the model)
 #   data/id/...                    (train + val image tars)
-#   data/ood/near_ood-000000.tar
+#   data/ood/near_ood_voc-000000.tar
+#   data/ood/near_ood_bdd-000000.tar
 #   data/ood/far_ood-000000.tar
 #
 # Usage (Colab VM, after Drive mount):
@@ -112,6 +113,10 @@ copy() {
   done
 }
 
+copy_as() {
+  copy_one "$1" "$(dirname "$2")" "$(basename "$2")"
+}
+
 copy_tree() {
   local src=$1 dest=$2
   if [ ! -d "$src" ]; then
@@ -135,19 +140,24 @@ copy_tree() {
   copied=$((copied + 1))
 }
 
+copy_near_ood_tars() {
+  # Distinct local names so VOC + BDD mounts can coexist under data/ood/.
+  copy_as "$SHARED/datasets/ood/near-ood-voc/near_ood-000000.tar" "$OOD_DIR/near_ood_voc-000000.tar"
+  copy_as "$SHARED/datasets/ood/near-ood-bdd/near_ood-000000.tar" "$OOD_DIR/near_ood_bdd-000000.tar"
+  copy "$SHARED/datasets/ood/far-ood/far_ood-000000.tar"         "$OOD_DIR/"
+}
+
 copy_voc_images() {
-  copy "$SHARED/datasets/id/voc/voc_yolo_train-*.tar"          "$ID_DIR/"
-  copy "$SHARED/datasets/id/voc/voc_yolo_val-000000.tar"       "$ID_DIR/"
-  copy "$SHARED/datasets/ood/near-ood-voc/near_ood-000000.tar" "$OOD_DIR/"
-  copy "$SHARED/datasets/ood/far-ood/far_ood-000000.tar"       "$OOD_DIR/"
+  copy "$SHARED/datasets/id/voc/voc_yolo_train-*.tar"    "$ID_DIR/"
+  copy "$SHARED/datasets/id/voc/voc_yolo_val-000000.tar" "$ID_DIR/"
+  copy_near_ood_tars
 }
 
 copy_bdd_images() {
   BDD_TRAIN_TAR="${BDD_TRAIN_TAR:-bdd_train_10k-*.tar}"
-  copy "$SHARED/datasets/id/bdd/$BDD_TRAIN_TAR"                "$ID_DIR/"
-  copy "$SHARED/datasets/id/bdd/bdd_val-000000.tar"            "$ID_DIR/"
-  copy "$SHARED/datasets/ood/near-ood-bdd/near_ood-000000.tar" "$OOD_DIR/"
-  copy "$SHARED/datasets/ood/far-ood/far_ood-000000.tar"       "$OOD_DIR/"
+  copy "$SHARED/datasets/id/bdd/$BDD_TRAIN_TAR"     "$ID_DIR/"
+  copy "$SHARED/datasets/id/bdd/bdd_val-000000.tar" "$ID_DIR/"
+  copy_near_ood_tars
 }
 
 echo "mount_frcnn_logits: DATASET=$DATASET  DEST=$DEST"
