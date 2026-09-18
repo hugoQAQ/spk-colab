@@ -104,16 +104,17 @@ def _fmt_mean_std(values: list[float]) -> str:
     return f"{float(np.mean(arr)):6.2f} ± {float(np.std(arr, ddof=1) if arr.size > 1 else 0.0):.2f}"
 
 
-def run_eval(args: argparse.Namespace) -> int:
-    activations = pd.read_csv(args.activations)
+def load_spk_splits(args: argparse.Namespace, activations_path: Path) -> tuple[dict, list[str]]:
+    activations = pd.read_csv(activations_path)
     missing_cols = [c for c in args.features if c not in activations.columns]
     if missing_cols:
-        raise SystemExit(f"missing columns in activations.csv: {missing_cols}")
+        raise SystemExit(f"missing columns in {activations_path}: {missing_cols}")
 
     class_names = sorted(activations["class"].astype(str).unique())
     class_map = build_class_map(class_names)
 
     splits: dict[str, pd.DataFrame] = {}
+    print(f"\n  activations {activations_path}", flush=True)
     for src, dst in SPLIT_MAP.items():
         part = activations[activations["data_source"] == src].copy()
         if dst == "train" and args.train_tp_only:
@@ -136,36 +137,62 @@ def run_eval(args: argparse.Namespace) -> int:
         if len(frame)
     }
     if "train" not in data or not len(data["train"]["x"]):
-        raise SystemExit("empty training split after filtering")
+        raise SystemExit(f"empty training split after filtering: {activations_path}")
     if "id_val" not in data or not len(data["id_val"]["x"]):
-        raise SystemExit("empty id_val split")
+        raise SystemExit(f"empty id_val split: {activations_path}")
+    return data, class_names
 
+
+def seed_jobs(args: argparse.Namespace) -> list[tuple[int, Path]]:
+    if args.seed_root is not None:
+        jobs = []
+        for directory in sorted(args.seed_root.glob("seed_*")):
+            csv_path = directory / "activations.csv"
+            if not csv_path.is_file():
+                continue
+            try:
+                seed = int(directory.name.split("_", 1)[1])
+            except ValueError:
+                continue
+            jobs.append((seed, csv_path))
+        if not jobs:
+            raise SystemExit(f"no seed_*/activations.csv under {args.seed_root}")
+        return jobs
+    if args.activations is None:
+        raise SystemExit("need --activations or --seed-root")
+    return [(int(seed), args.activations) for seed in args.seeds]
+
+
+def run_eval(args: argparse.Namespace) -> int:
+    jobs = seed_jobs(args)
     args.out.mkdir(parents=True, exist_ok=True)
-    eval_names = [k for k in data if k != "train"]
-    ood_splits = [k for k in eval_names if k != "id_val"]
     rows = []
+    ood_splits_seen: list[str] = []
     by_method: dict[str, dict[str, dict[str, list[float]]]] = {
-        method_label(m): {split: {"fpr95_pct": [], "auroc_pct": []} for split in ood_splits}
-        for m in args.methods
+        method_label(m): {} for m in args.methods
     }
     report = {
         "feature_set": list(args.features),
         "train_tp_only": args.train_tp_only,
         "outlier_removal": "none",
-        "classes": class_names,
-        "seeds": list(args.seeds),
+        "jobs": [{"seed": s, "activations": str(p)} for s, p in jobs],
         "methods": {},
         "errors": {},
     }
 
     print(f"\n=== SPK baselines ({len(args.features)}D, outlier=none) -> {args.out} ===", flush=True)
-    print(
-        f"train={len(data['train']['x']):,}  seeds={list(args.seeds)}  "
-        f"bam_density={args.bam_density}  knn_k={args.knn_k}",
-        flush=True,
-    )
+    print(f"jobs={len(jobs)}  bam_density={args.bam_density}  knn_k={args.knn_k}", flush=True)
 
-    for seed in args.seeds:
+    for seed, activations_path in jobs:
+        data, class_names = load_spk_splits(args, activations_path)
+        report.setdefault("classes", class_names)
+        eval_names = [k for k in data if k != "train"]
+        ood_splits = [k for k in eval_names if k != "id_val"]
+        for split in ood_splits:
+            if split not in ood_splits_seen:
+                ood_splits_seen.append(split)
+            for method in args.methods:
+                by_method[method_label(method)].setdefault(split, {"fpr95_pct": [], "auroc_pct": []})
         baseline_args = SimpleNamespace(
             mds_labels="predicted",
             covariance=args.covariance,
@@ -264,7 +291,9 @@ def run_eval(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--activations", type=Path, required=True)
+    parser.add_argument("--activations", type=Path, default=None)
+    parser.add_argument("--seed-root", type=Path, default=None,
+                        help="concept_head_ood dir with seed_*/activations.csv (one eval seed per head seed)")
     parser.add_argument("--gt-index", type=Path, default=Path("/content/spk/data/id/gt_voc.json"))
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--features", nargs="+", choices=["known_max", "unknown", "proxy_max", "relative_area", "native_knn"],

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Concept-head OOD experiment (YOLO or Faster R-CNN; VOC or BDD).
+"""Concept-head OOD experiment (YOLO, Faster R-CNN, or RT-DETR; VOC or BDD).
 
 Three stages, run in order:
 
@@ -9,33 +9,35 @@ Three stages, run in order:
                 -> data/{detector}/{dataset}/roi/{id_train,id_val,near_ood,far_ood}.pt
   C  TRAIN+EVAL concept heads from data/{detector}/{dataset}/training_data.pt,
                 SPK4 + native kNN, classwise Isolation Forest
-                -> data/{detector}/{dataset}/concept_head_ood/seed_{42,43,44}/
-                pooled mean±std at concept_head_ood/pooled_mean_std.json
+                -> data/{detector}/{dataset}/concept_head_ood/seed_{seed}/
 
-Default protocol is three independent concept-head seeds (42, 43, 44). Stage A/B
-run once; stage C retrains heads and rescores ROIs per seed. `--seed N` runs a
-single seed. Headline FPR95 / AUROC tables use no ID-val outlier removal.
+Default is one concept-head seed (42). Pass `--seeds 42 43 44` for a 3-seed
+run (stage A/B once; stage C retrains and rescores per seed, then mean±std).
+Headline FPR95 / AUROC tables use no ID-val outlier removal.
 
-Checkpoints live under model/{detector}/ so one Colab session can hold YOLO and FRCNN.
+Checkpoints live under model/{detector}/ so one Colab session can hold YOLO, FRCNN, and RT-DETR.
 Image tars under data/id and data/ood are shared across detectors.
 
-Both detectors keep at most 30 boxes per image after NMS (`max_det=30`).
+All three detectors keep at most 30 boxes per image (`max_det=30`).
 
 Examples
 --------
     DETECTOR=yolo DATASET=voc bash mount_data.sh
     python run.py --root /content/spk --detector yolo --dataset voc
-    python run.py --root /content/spk --detector yolo --dataset voc --seed 42
+    python run.py --root /content/spk --detector yolo --dataset voc --seeds 42 43 44
 
     DETECTOR=yolo DATASET=bdd bash mount_data.sh
     python run.py --root /content/spk --detector yolo --dataset bdd --max-images 200 --epochs 6
     python run.py --root /content/spk --detector yolo --dataset bdd --splits near_ood far_ood --force --extract-only
-    # After mount_data.sh copied roi/native_knn/concept_head_ood, this skips
+    # After mount_data.sh copied roi/native_knn/concept_head_ood/seed_*, this skips
     # extract and head training; it only builds gt_{dataset}.json if missing, then eval.
     python run.py --root /content/spk --detector yolo --dataset bdd
 
     DETECTOR=frcnn DATASET=voc bash mount_data.sh
     python run.py --root /content/spk --detector frcnn --dataset voc
+    python run.py --root /content/spk --detector frcnn --dataset bdd
+    python run.py --root /content/spk --detector rtdetr --dataset voc
+    python run.py --root /content/spk --detector rtdetr --dataset bdd
     # checkpoint: /content/spk/model/frcnn/voc_vanilla.pth
     # outputs:    /content/spk/data/frcnn/voc/concept_head_ood/
 """
@@ -72,17 +74,6 @@ from tqdm.auto import tqdm
 # so fall back to the cwd and let --root override in every case.
 ROOT = Path(globals().get("__file__", "run.py")).resolve().parent
 
-CHECKPOINT = ROOT / "model/yolo/voc_vanilla.pt"
-FRCNN_CFG = ROOT / "model/frcnn/frcnn_fx/FX_vanilla_voc.yaml"
-DATASET_DIR = ROOT / "data/id"
-OOD_DIR = ROOT / "data/ood"
-ARCH_DIR = ROOT / "data/yolo/voc"
-ROI_DIR = ARCH_DIR / "roi"
-GT_INDEX = ROOT / "data/id/gt_voc.json"
-TRAINING_DATA = ARCH_DIR / "training_data.pt"
-NATIVE_ROOT = ARCH_DIR / "native_knn"
-PRIOR_DIR = ARCH_DIR / "detection_prior_rows"
-
 VOC20 = [
     "aeroplane", "bicycle", "bird", "boat", "bottle", "bus", "car", "cat",
     "chair", "cow", "diningtable", "dog", "horse", "motorbike", "person",
@@ -104,6 +95,11 @@ FRCNN_VOC20 = (
     "person", "bird", "cat", "cow", "dog", "horse", "sheep", "airplane",
     "bicycle", "boat", "bus", "car", "motorcycle", "train", "bottle",
     "chair", "dining table", "potted plant", "couch", "tv",
+)
+
+FRCNN_BDD10 = (
+    "person", "rider", "car", "truck", "bus", "train", "motorcycle", "bicycle",
+    "traffic_light", "traffic_sign",
 )
 
 
@@ -135,88 +131,64 @@ class DatasetProfile:
     native_feature_definition: str = "YOLO neck P3/P4/P5 global mean+std pooling"
 
 
-VOC_PROFILE = DatasetProfile(
-    name="voc",
-    checkpoint="voc_vanilla.pt",
-    splits=("voc_train", "voc_val", "near_ood", "far_ood"),
-    id_splits=frozenset({"voc_train", "voc_val"}),
-    split_tar_prefix={
-        "voc_train": "voc_yolo_train",
-        "voc_val": "voc_yolo_val",
-        "near_ood": "near_ood_voc",
-        "far_ood": "far_ood",
-    },
-    split_output_names={
-        "voc_train": "id_train.pt",
-        "voc_val": "id_val.pt",
-        "near_ood": "near_ood.pt",
-        "far_ood": "far_ood.pt",
-    },
-    split_to_knn={
-        "voc_train": "voc_id_train",
-        "voc_val": "voc_id_val",
-        "near_ood": "near_ood_voc",
-        "far_ood": "far_ood_voc",
-    },
-    split_to_prior={
-        "voc_train": ("train_detector_rows.csv", "id_train_tp"),
-        "voc_val": ("val_detector_rows.csv", "id_val_tp"),
-        "near_ood": ("near_detector_rows.csv", "near_ood_fp"),
-        "far_ood": ("far_detector_rows.csv", "far_ood_fp"),
-    },
-    native_split_specs={
-        "voc_id_train": {"data_source": "id_train_tp", "protocol": "voc_fp8_train_pool"},
-        "voc_id_val": {"data_source": "id_val_tp", "protocol": "voc_id"},
-        "near_ood_voc": {"data_source": "near_ood_fp", "protocol": "near_far_ood"},
-        "far_ood_voc": {"data_source": "far_ood_fp", "protocol": "near_far_ood"},
-    },
-    label_classes=tuple(VOC20),
-    eval_classes=VOC14,
-    gt_train_glob="voc_yolo_train-*.tar",
-    gt_fixed_size=None,
-    roi_cache_type="voc_fp8_roi_features",
-)
+def make_dataset_profile(
+    name: str,
+    train_prefix: str,
+    val_prefix: str,
+    label_classes: tuple[str, ...],
+    eval_classes: frozenset[str],
+    *,
+    fixed_size: tuple[int, int] | None = None,
+    strip_train_prefix: bool = False,
+    label_aliases: dict[str, str] | None = None,
+) -> DatasetProfile:
+    """VOC 和 BDD 使用相同的目录约定，仅在调用处列出不同配置。"""
+    train, val = f"{name}_train", f"{name}_val"
+    return DatasetProfile(
+        name=name,
+        checkpoint=f"{name}_vanilla.pt",
+        splits=(train, val, "near_ood", "far_ood"),
+        id_splits=frozenset({train, val}),
+        split_tar_prefix={
+            train: train_prefix, val: val_prefix,
+            "near_ood": f"near_ood_{name}", "far_ood": "far_ood",
+        },
+        split_output_names={
+            train: "id_train.pt", val: "id_val.pt",
+            "near_ood": "near_ood.pt", "far_ood": "far_ood.pt",
+        },
+        split_to_knn={
+            train: f"{name}_id_train", val: f"{name}_id_val",
+            "near_ood": f"near_ood_{name}", "far_ood": f"far_ood_{name}",
+        },
+        split_to_prior={
+            train: ("train_detector_rows.csv", "id_train_tp"),
+            val: ("val_detector_rows.csv", "id_val_tp"),
+            "near_ood": ("near_detector_rows.csv", "near_ood_fp"),
+            "far_ood": ("far_detector_rows.csv", "far_ood_fp"),
+        },
+        native_split_specs={
+            f"{name}_id_train": {"data_source": "id_train_tp", "protocol": f"{name}_fp8_train_pool"},
+            f"{name}_id_val": {"data_source": "id_val_tp", "protocol": f"{name}_id"},
+            f"near_ood_{name}": {"data_source": "near_ood_fp", "protocol": "near_far_ood"},
+            f"far_ood_{name}": {"data_source": "far_ood_fp", "protocol": "near_far_ood"},
+        },
+        label_classes=label_classes,
+        eval_classes=eval_classes,
+        gt_train_glob=f"{train_prefix}-*.tar",
+        gt_fixed_size=fixed_size,
+        roi_cache_type=f"{name}_fp8_roi_features",
+        strip_train_prefix=strip_train_prefix,
+        label_aliases=label_aliases or {},
+    )
 
-BDD_PROFILE = DatasetProfile(
-    name="bdd",
-    checkpoint="bdd_vanilla.pt",
-    splits=("bdd_train", "bdd_val", "near_ood", "far_ood"),
-    id_splits=frozenset({"bdd_train", "bdd_val"}),
-    split_tar_prefix={
-        "bdd_train": "bdd_train_10k",
-        "bdd_val": "bdd_val",
-        "near_ood": "near_ood_bdd",
-        "far_ood": "far_ood",
-    },
-    split_output_names={
-        "bdd_train": "id_train.pt",
-        "bdd_val": "id_val.pt",
-        "near_ood": "near_ood.pt",
-        "far_ood": "far_ood.pt",
-    },
-    split_to_knn={
-        "bdd_train": "bdd_id_train",
-        "bdd_val": "bdd_id_val",
-        "near_ood": "near_ood_bdd",
-        "far_ood": "far_ood_bdd",
-    },
-    split_to_prior={
-        "bdd_train": ("train_detector_rows.csv", "id_train_tp"),
-        "bdd_val": ("val_detector_rows.csv", "id_val_tp"),
-        "near_ood": ("near_detector_rows.csv", "near_ood_fp"),
-        "far_ood": ("far_detector_rows.csv", "far_ood_fp"),
-    },
-    native_split_specs={
-        "bdd_id_train": {"data_source": "id_train_tp", "protocol": "bdd_fp8_train_pool"},
-        "bdd_id_val": {"data_source": "id_val_tp", "protocol": "bdd_id"},
-        "near_ood_bdd": {"data_source": "near_ood_fp", "protocol": "near_far_ood"},
-        "far_ood_bdd": {"data_source": "far_ood_fp", "protocol": "near_far_ood"},
-    },
-    label_classes=tuple(BDD10),
-    eval_classes=frozenset(BDD10),
-    gt_train_glob="bdd_train_10k-*.tar",
-    gt_fixed_size=(1280, 720),
-    roi_cache_type="bdd_fp8_roi_features",
+
+VOC_PROFILE = make_dataset_profile(
+    "voc", "voc_yolo_train", "voc_yolo_val", tuple(VOC20), VOC14,
+)
+BDD_PROFILE = make_dataset_profile(
+    "bdd", "bdd_train_10k", "bdd_val", tuple(BDD10), frozenset(BDD10),
+    fixed_size=(1280, 720),
     strip_train_prefix=True,
     label_aliases={
         "pedestrian": "person",
@@ -245,10 +217,43 @@ FRCNN_VOC_PROFILE = replace(
     native_feature_definition="Faster R-CNN FPN p2-p5 global mean+std pooling -> 2048-d vector",
 )
 
+FRCNN_BDD_PROFILE = replace(
+    BDD_PROFILE,
+    detector="frcnn",
+    checkpoint="bdd_vanilla.pth",
+    feature_channels=256,
+    roi_cache_type="frcnn_bdd_fp8_roi_features",
+    detector_class_names=FRCNN_BDD10,
+    frcnn_config="model/frcnn/frcnn_fx/FX_vanilla_bdd.yaml",
+    roi_feature_definition="Faster R-CNN FPN p2-p5 ROIAlign 256x7x7; max_det=30",
+    native_feature_definition="Faster R-CNN FPN p2-p5 global mean+std pooling -> 2048-d vector",
+)
+
+RTDETR_VOC_PROFILE = replace(
+    VOC_PROFILE,
+    detector="rtdetr",
+    checkpoint="voc_vanilla.pt",
+    roi_cache_type="rtdetr_voc_fp8_roi_features",
+    roi_feature_definition="RT-DETR hybrid-encoder multi-scale ROIAlign; NMS-free top-30",
+    native_feature_definition="RT-DETR encoder feature-map global mean+std pooling",
+)
+
+RTDETR_BDD_PROFILE = replace(
+    BDD_PROFILE,
+    detector="rtdetr",
+    checkpoint="bdd_vanilla.pt",
+    roi_cache_type="rtdetr_bdd_fp8_roi_features",
+    roi_feature_definition="RT-DETR hybrid-encoder multi-scale ROIAlign; NMS-free top-30",
+    native_feature_definition="RT-DETR encoder feature-map global mean+std pooling",
+)
+
 PROFILES: dict[tuple[str, str], DatasetProfile] = {
     ("yolo", "voc"): VOC_PROFILE,
     ("yolo", "bdd"): BDD_PROFILE,
     ("frcnn", "voc"): FRCNN_VOC_PROFILE,
+    ("frcnn", "bdd"): FRCNN_BDD_PROFILE,
+    ("rtdetr", "voc"): RTDETR_VOC_PROFILE,
+    ("rtdetr", "bdd"): RTDETR_BDD_PROFILE,
 }
 PROFILE = VOC_PROFILE
 
@@ -292,6 +297,8 @@ def refresh_paths() -> None:
     PRIOR_DIR = ARCH_DIR / "detection_prior_rows"
     FRCNN_CFG = ROOT / PROFILE.frcnn_config
 
+
+refresh_paths()
 
 def resolve_training_data(path: Path) -> Path:
     """Drive/rsync sometimes materializes `training_data.pt` as a directory."""
@@ -407,19 +414,7 @@ def choose_batch_size(
     if peak is None:
         print(f"  {label}: even batch={min_batch} OOM; using {min_batch}", flush=True)
         return min_batch
-    if peak <= budget:
-        best = min_batch
-        while hi < max_batch:
-            nxt = min(hi * 2, max_batch)
-            peak = _peak(nxt)
-            if peak is None or peak > budget:
-                lo, hi = best, nxt
-                break
-            best, lo, hi = nxt, nxt, nxt
-            if nxt == max_batch:
-                lo, hi = nxt, nxt
-                break
-    else:
+    if peak > budget:
         print(
             f"  {label}: batch={min_batch} already uses {peak / 1e9:.1f} GB "
             f"(budget {budget / 1e9:.1f} GB of {total / 1e9:.1f} GB); keeping {min_batch}",
@@ -427,14 +422,21 @@ def choose_batch_size(
         )
         return min_batch
 
-    if lo < hi:
-        while lo + 1 < hi:
-            mid = (lo + hi) // 2
-            peak = _peak(mid)
-            if peak is not None and peak <= budget:
-                best, lo = mid, mid
-            else:
-                hi = mid
+    # 先逐次翻倍，找到超过显存预算的上界，再用二分搜索缩小范围。
+    while hi < max_batch:
+        hi = min(hi * 2, max_batch)
+        peak = _peak(hi)
+        if peak is None or peak > budget:
+            break
+        best = lo = hi
+
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        peak = _peak(mid)
+        if peak is not None and peak <= budget:
+            best = lo = mid
+        else:
+            hi = mid
 
     peak = _peak(best) or 0
     print(
@@ -456,6 +458,18 @@ def tune_extract_batch(engine, args: argparse.Namespace) -> int:
         # how many tars we decode before that loop.
         print("  extract batch: 8 (FRCNN: decode 8, infer 1 at a time)", flush=True)
         return 8
+    if PROFILE.detector == "rtdetr":
+        dummy = np.full((IMGSZ, IMGSZ, 3), 114, dtype=np.uint8)
+
+        def trial(batch: int) -> None:
+            engine.infer_batch_bgr([dummy] * batch)
+
+        chosen = choose_batch_size(
+            trial, args.device, args.vram_frac,
+            min_batch=1, max_batch=32, default=EXTRACT_BATCH, label="extract batch",
+        )
+        torch.cuda.empty_cache()
+        return max(chosen, 1)
 
     dummy = np.full((IMGSZ, IMGSZ, 3), 114, dtype=np.uint8)
     worst_boxes = torch.tensor(
@@ -886,9 +900,8 @@ class YOLOUnifiedForward:
         # After NMS: [N, 6] = (x1, y1, x2, y2, score, class_id) in letterbox pixels.
         if pred is None or pred.numel() == 0:
             return []
-        bbox, score, label = pred.split((4, 1, 1), dim=-1)
         detections: list[dict[str, Any]] = []
-        for row in torch.cat([bbox, score, label], dim=-1):
+        for row in pred:
             raw_label = str(self.names[int(row[5].item())]).strip().lower()
             pred_class = PROFILE.label_aliases.get(raw_label, raw_label)
             if pred_class in PROFILE.eval_classes:
@@ -955,6 +968,178 @@ class YOLOUnifiedForward:
                 total_channels = sum(f.shape[0] for f in feats_per_image)
                 roi = torch.empty((0, total_channels, ROI_SIZE, ROI_SIZE), dtype=torch.float32)
 
+            results.append(UnifiedImageResult(detections, native, roi))
+        return results
+
+
+def _last_decoder_layer(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.ndim == 4:
+        return tensor[-1]
+    if tensor.ndim == 3:
+        return tensor
+    raise ValueError(f"unexpected decoder tensor shape {tuple(tensor.shape)}")
+
+
+class RTDETRUnifiedForward:
+    """Ultralytics RT-DETR: NMS-free detections + encoder ROIAlign + mean+std native."""
+
+    def __init__(self, checkpoint_path: str | Path, device: str | torch.device) -> None:
+        from ultralytics import RTDETR
+
+        wrapper = RTDETR(str(checkpoint_path))
+        self.names = wrapper.names
+        self.model = wrapper.model.to(device).eval()
+        self.device = torch.device(device)
+        self.max_det = int(PROFILE.max_det)
+        for param in self.model.parameters():
+            param.requires_grad = False
+        self._feat_buf: list[torch.Tensor] | None = None
+        hooked = False
+        for module in self.model.model:
+            name = module.__class__.__name__
+            if "Encoder" in name or name.startswith("Hybrid"):
+                module.register_forward_hook(self._encoder_hook)
+                hooked = True
+                break
+        if not hooked:
+            raise RuntimeError("RT-DETR HybridEncoder not found; cannot ROIAlign encoder features")
+
+    def _encoder_hook(self, _module, _inp, out) -> None:
+        if isinstance(out, (list, tuple)):
+            self._feat_buf = [t.detach() for t in out]
+        else:
+            self._feat_buf = [out.detach()]
+
+    @staticmethod
+    def _scale_fill_rgb(image_rgb: np.ndarray) -> tuple[torch.Tensor, dict[str, Any]]:
+        h, w = image_rgb.shape[:2]
+        resized = cv2.resize(image_rgb, (IMGSZ, IMGSZ), interpolation=cv2.INTER_LINEAR)
+        tensor = torch.from_numpy(resized).permute(2, 0, 1).float().div(255.0)
+        return tensor.unsqueeze(0), {"orig_hw": (h, w)}
+
+    @staticmethod
+    def _xywh_norm_to_xyxy_orig(xywh: torch.Tensor, orig_hw: tuple[int, int]) -> torch.Tensor:
+        boxes = xywh.reshape(-1, 4).float()
+        orig_h, orig_w = orig_hw
+        cx, cy, bw, bh = boxes.unbind(dim=1)
+        return torch.stack([
+            (cx - bw / 2) * orig_w,
+            (cy - bh / 2) * orig_h,
+            (cx + bw / 2) * orig_w,
+            (cy + bh / 2) * orig_h,
+        ], dim=1)
+
+    def _project_boxes(self, boxes_xyxy: torch.Tensor, orig_hw: tuple[int, int]) -> torch.Tensor:
+        orig_h, orig_w = orig_hw
+        boxes = boxes_xyxy.clone().to(torch.float32)
+        boxes[:, [0, 2]] *= float(IMGSZ) / max(orig_w, 1)
+        boxes[:, [1, 3]] *= float(IMGSZ) / max(orig_h, 1)
+        limit = float(IMGSZ - 1)
+        boxes[:, 0] = boxes[:, 0].clamp_(0.0, limit)
+        boxes[:, 1] = boxes[:, 1].clamp_(0.0, limit)
+        boxes[:, 2] = boxes[:, 2].clamp_(min=1.0, max=float(IMGSZ))
+        boxes[:, 3] = boxes[:, 3].clamp_(min=1.0, max=float(IMGSZ))
+        boxes[:, 2] = torch.maximum(boxes[:, 2], boxes[:, 0] + 1.0)
+        boxes[:, 3] = torch.maximum(boxes[:, 3], boxes[:, 1] + 1.0)
+        return boxes
+
+    def _parse_decoder(self, out: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        n_classes = len(self.names)
+        if isinstance(out, (list, tuple)) and len(out) >= 2 and isinstance(out[1], (list, tuple)):
+            extra = out[1]
+            boxes = _last_decoder_layer(extra[0]).float()
+            logits = _last_decoder_layer(extra[1]).float()
+            return boxes, logits
+        preds = out[0] if isinstance(out, (list, tuple)) else out
+        if preds.ndim != 3 or preds.shape[-1] < 4 + n_classes:
+            raise ValueError(f"unexpected RT-DETR output shape {tuple(getattr(preds, 'shape', ()))}")
+        boxes = preds[..., :4].float()
+        scores = preds[..., 4:4 + n_classes].float().clamp(1e-6, 1.0 - 1e-6)
+        logits = torch.log(scores / (1.0 - scores))
+        return boxes, logits
+
+    def _decode_queries(
+        self, boxes_xywh: torch.Tensor, logits: torch.Tensor, orig_hw: tuple[int, int]
+    ) -> list[dict[str, Any]]:
+        scores = logits.sigmoid()
+        conf, labels = scores.max(dim=-1)
+        keep = conf > CONF
+        if not keep.any():
+            return []
+        conf, labels = conf[keep], labels[keep]
+        boxes_kept = boxes_xywh[keep]
+        order = torch.argsort(conf, descending=True)[: self.max_det]
+        detections: list[dict[str, Any]] = []
+        for idx in order.tolist():
+            label = int(labels[idx].item())
+            raw_label = str(self.names[label]).strip().lower()
+            pred_class = PROFILE.label_aliases.get(raw_label, raw_label)
+            if pred_class not in PROFILE.eval_classes:
+                continue
+            xyxy = self._xywh_norm_to_xyxy_orig(boxes_kept[idx], orig_hw)[0]
+            detections.append({
+                "pred_class": pred_class,
+                "detector_class": pred_class,
+                "detector_label": raw_label,
+                "detector_confidence": float(conf[idx].item()),
+                "bbox_xyxy": xyxy.detach().cpu().tolist(),
+            })
+        return detections
+
+    def _pool_native(self, feats_per_image: list[torch.Tensor]) -> torch.Tensor:
+        pooled: list[torch.Tensor] = []
+        for feat in feats_per_image:
+            pooled.append(feat.mean(dim=(1, 2)))
+            pooled.append(feat.std(dim=(1, 2), unbiased=False))
+        return torch.cat(pooled, dim=0)
+
+    def _roi_align(
+        self, feats_per_image: list[torch.Tensor], boxes_model: torch.Tensor
+    ) -> torch.Tensor:
+        total_channels = sum(f.shape[0] for f in feats_per_image)
+        if boxes_model.numel() == 0:
+            return torch.empty((0, total_channels, ROI_SIZE, ROI_SIZE), dtype=torch.float32)
+        batch_idx = torch.zeros((boxes_model.shape[0], 1), dtype=torch.float32, device=self.device)
+        rois = torch.cat([batch_idx, boxes_model.to(self.device)], dim=1).to(dtype=feats_per_image[0].dtype)
+        pooled = []
+        for feat in feats_per_image:
+            stride = float(IMGSZ) / float(feat.shape[-2])
+            pooled.append(
+                roi_align(
+                    feat.unsqueeze(0), rois, output_size=(ROI_SIZE, ROI_SIZE),
+                    spatial_scale=1.0 / stride, aligned=True,
+                )
+            )
+        return torch.cat(pooled, dim=1).cpu()
+
+    @torch.inference_mode()
+    def infer_batch_bgr(self, images_bgr: list[np.ndarray]) -> list[UnifiedImageResult]:
+        if not images_bgr:
+            return []
+        tensors, infos = [], []
+        for image_bgr in images_bgr:
+            rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+            tensor, info = self._scale_fill_rgb(rgb)
+            tensors.append(tensor)
+            infos.append(info)
+        batch_tensor = torch.cat(tensors, dim=0)
+        use_amp = self.device.type == "cuda"
+        with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=use_amp):
+            out = self.model(batch_tensor.to(self.device))
+        if not self._feat_buf:
+            raise RuntimeError("RT-DETR encoder hook produced no feature maps")
+        boxes, logits = self._parse_decoder(out)
+        results: list[UnifiedImageResult] = []
+        for batch_idx, info in enumerate(infos):
+            feats = [level[batch_idx] for level in self._feat_buf]
+            native = self._pool_native(feats).detach().cpu()
+            detections = self._decode_queries(boxes[batch_idx], logits[batch_idx], info["orig_hw"])
+            if detections:
+                det_boxes = torch.tensor([d["bbox_xyxy"] for d in detections], dtype=torch.float32)
+                roi = self._roi_align(feats, self._project_boxes(det_boxes, info["orig_hw"]))
+            else:
+                total = sum(f.shape[0] for f in feats)
+                roi = torch.empty((0, total, ROI_SIZE, ROI_SIZE), dtype=torch.float32)
             results.append(UnifiedImageResult(detections, native, roi))
         return results
 
@@ -1108,6 +1293,8 @@ class FRCNNUnifiedForward:
 def build_engine(device: str | torch.device):
     if PROFILE.detector == "frcnn":
         return FRCNNUnifiedForward(CHECKPOINT, device)
+    if PROFILE.detector == "rtdetr":
+        return RTDETRUnifiedForward(CHECKPOINT, device)
     return YOLOUnifiedForward(CHECKPOINT, device)
 
 
@@ -1267,7 +1454,6 @@ def write_extraction_summary(summaries: list[dict[str, Any]], elapsed_sec: float
     for item in summaries:
         by_split[item["split"]] = item
     ordered: list[dict[str, Any]] = []
-    seen: set[str] = set()
     for split in SPLITS:
         cache = ROI_DIR / SPLIT_OUTPUT_NAMES[split]
         if split in by_split:
@@ -1278,13 +1464,11 @@ def write_extraction_summary(summaries: list[dict[str, Any]], elapsed_sec: float
                 roi = {**stats, **roi}
                 item = {
                     **item,
-                    "num_images": (
-                        item.get("num_images")
-                        if item.get("num_images") is not None
-                        else stats.get("num_images")
-                    ),
+                    "num_images": item.get("num_images"),
                     "roi": roi,
                 }
+                if item["num_images"] is None:
+                    item["num_images"] = stats.get("num_images")
             ordered.append(item)
         else:
             stats = roi_cache_counts(cache)
@@ -1293,9 +1477,8 @@ def write_extraction_summary(summaries: list[dict[str, Any]], elapsed_sec: float
                 "num_images": stats.get("num_images"),
                 "roi": {**stats, "status": stats.get("status", "existing")},
             })
-        seen.add(split)
     for split, item in by_split.items():
-        if split not in seen:
+        if split not in SPLITS:
             ordered.append(item)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -1323,6 +1506,46 @@ def split_needs_extract(split: str, args: argparse.Namespace) -> tuple[bool, boo
     need_native = args.with_native and not native_ready(native_split_dir(split))
     need_prior = bool(args.with_prior)
     return need_roi, need_native, need_prior
+
+
+def save_roi_cache(
+    roi_path: Path, split: str, roi_fp8_chunks: list, roi_scale_chunks: list,
+    roi_rows: list[dict], num_images: int, elapsed: float,
+) -> dict:
+    """将 ROI 特征和元数据按原有格式保存，返回提取摘要中的 ROI 条目。"""
+    if roi_fp8_chunks:
+        features_fp8 = torch.cat(roi_fp8_chunks, dim=0)
+        scales = torch.cat(roi_scale_chunks, dim=0)
+    else:
+        features_fp8 = torch.empty(
+            (0, PROFILE.feature_channels, ROI_SIZE, ROI_SIZE), dtype=torch.float8_e4m3fn
+        )
+        scales = torch.empty((0,), dtype=torch.float32)
+    payload = {
+        "cache_type": PROFILE.roi_cache_type,
+        "dataset": PROFILE.name,
+        "detector": PROFILE.detector,
+        "split": split,
+        "ood_protocol": split if split in PROFILE.id_splits else "near_far_ood",
+        "features_fp8": features_fp8,
+        "scales": scales,
+        "metadata": roi_rows,
+        "num_detections": int(features_fp8.shape[0]),
+        "num_images": int(num_images),
+        "feature_channels": int(features_fp8.shape[1]) if features_fp8.numel() else PROFILE.feature_channels,
+        "roi_size": ROI_SIZE,
+        "fp8_format": "e4m3fn_per_roi",
+        "feature_definition": PROFILE.roi_feature_definition,
+        "detector_path": str(CHECKPOINT.resolve()),
+        "inference": {
+            "conf": CONF, "max_det": PROFILE.max_det, "iou": IOU,
+            "imgsz": IMGSZ, "unified_forward": True,
+        },
+        "elapsed_sec": elapsed,
+    }
+    roi_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, roi_path)
+    return {"output": str(roi_path.resolve()), "num_detections": int(payload["num_detections"])}
 
 
 def extract_split(split: str, engine, args: argparse.Namespace) -> dict[str, Any]:
@@ -1446,13 +1669,13 @@ def extract_split(split: str, engine, args: argparse.Namespace) -> dict[str, Any
                         "embedding_chunk": out_name,
                         "embedding_row_in_chunk": row_in_chunk,
                     }
-                    chunk_image_rows.append({**common, "num_detections": len(result.detections)})
+                    image_record = {**common, "num_detections": len(result.detections)}
+                    chunk_image_rows.append(image_record)
+                    native_image_rows.append(image_record)
                     for det_idx, det in enumerate(result.detections):
-                        chunk_detection_rows.append(
-                            {**common, "detection_index_in_image": det_idx, **det}
-                        )
-                    native_image_rows.append(chunk_image_rows[-1])
-                    native_detection_rows.extend(chunk_detection_rows[-len(result.detections):] if result.detections else [])
+                        detection_record = {**common, "detection_index_in_image": det_idx, **det}
+                        chunk_detection_rows.append(detection_record)
+                        native_detection_rows.append(detection_record)
                 image_row += 1
 
     if need_native and chunk_embeddings:
@@ -1472,39 +1695,9 @@ def extract_split(split: str, engine, args: argparse.Namespace) -> dict[str, Any
         "elapsed_sec": elapsed,
     }
     if need_roi:
-        if roi_fp8_chunks:
-            features_fp8 = torch.cat(roi_fp8_chunks, dim=0)
-            scales = torch.cat(roi_scale_chunks, dim=0)
-        else:
-            features_fp8 = torch.empty(
-                (0, PROFILE.feature_channels, ROI_SIZE, ROI_SIZE), dtype=torch.float8_e4m3fn
-            )
-            scales = torch.empty((0,), dtype=torch.float32)
-        payload = {
-            "cache_type": PROFILE.roi_cache_type,
-            "dataset": PROFILE.name,
-            "detector": PROFILE.detector,
-            "split": split,
-            "ood_protocol": split if split in PROFILE.id_splits else "near_far_ood",
-            "features_fp8": features_fp8,
-            "scales": scales,
-            "metadata": roi_rows,
-            "num_detections": int(features_fp8.shape[0]),
-            "num_images": int(num_images),
-            "feature_channels": int(features_fp8.shape[1]) if features_fp8.numel() else PROFILE.feature_channels,
-            "roi_size": ROI_SIZE,
-            "fp8_format": "e4m3fn_per_roi",
-            "feature_definition": PROFILE.roi_feature_definition,
-            "detector_path": str(CHECKPOINT.resolve()),
-            "inference": {
-                "conf": CONF, "max_det": PROFILE.max_det, "iou": IOU,
-                "imgsz": IMGSZ, "unified_forward": True,
-            },
-            "elapsed_sec": elapsed,
-        }
-        roi_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(payload, roi_path)
-        summary["roi"] = {"output": str(roi_path.resolve()), "num_detections": int(payload["num_detections"])}
+        summary["roi"] = save_roi_cache(
+            roi_path, split, roi_fp8_chunks, roi_scale_chunks, roi_rows, num_images, elapsed,
+        )
     else:
         summary["roi"] = {"output": str(roi_path.resolve()), "status": "kept_existing"}
     if args.with_prior:
@@ -1557,10 +1750,10 @@ def build_class_data(bundle: dict, class_name: str):
     if unknown_block is None:
         raise ValueError(f"{class_name}: missing unknown block")
 
-    compact_schema = "per_class" not in bundle
-    part_based = bool(prox_block is not None) if compact_schema else bool(
-        entry.get("is_part_based", True)
-    )
+    if "per_class" in bundle:
+        part_based = bool(entry.get("is_part_based", True))
+    else:
+        part_based = prox_block is not None
 
     xs: list[torch.Tensor] = []
     ys: list[torch.Tensor] = []
@@ -1863,6 +2056,15 @@ def fpr95(id_scores: np.ndarray, ood_scores: np.ndarray) -> float:
     return 100.0 * float((ood_scores >= threshold).sum()) / len(ood_scores)
 
 
+def auroc_pct(id_scores: np.ndarray, ood_scores: np.ndarray) -> float:
+    """AUROC (%) with Isolation Forest scores (high = ID-like)."""
+    if len(id_scores) == 0 or len(ood_scores) == 0:
+        return float("nan")
+    y = np.concatenate([np.ones(len(id_scores)), np.zeros(len(ood_scores))])
+    s = np.concatenate([id_scores, ood_scores])
+    return 100.0 * float(roc_auc_score(y, s))
+
+
 def drop_lowest_id_val(scores: np.ndarray, fraction: float = ID_VAL_OUTLIER_FRACTION) -> np.ndarray:
     """Drop the least ID-like ID-val scores (Isolation Forest: low = outlier)."""
     drop = min(int(np.floor(fraction * len(scores))), max(len(scores) - 5, 0))
@@ -1877,8 +2079,9 @@ def evaluate(
     id_train_tp: pd.DataFrame,
     feature_cols: list[str],
     drop_id_val_outliers: bool,
+    seed: int = 42,
 ) -> dict:
-    """One Isolation Forest per class; report per-class and pooled FPR95."""
+    """One Isolation Forest per class; report per-class and pooled FPR95 / AUROC."""
     per_class, pooled = {}, {"id_val": [], "near_ood": [], "far_ood": []}
 
     for class_name in class_names:
@@ -1904,12 +2107,12 @@ def evaluate(
             )
             continue
         if len(train) > 1500:  # cap keeps fitting fast; 1500 is plenty for 4-5 features
-            train = train[np.random.default_rng(42).choice(len(train), 1500, replace=False)]
+            train = train[np.random.default_rng(seed).choice(len(train), 1500, replace=False)]
 
         scaler = StandardScaler().fit(train)
         forest = IsolationForest(
             n_estimators=200, contamination=0.05,
-            max_samples=min(512, len(train)), random_state=42, n_jobs=-1,
+            max_samples=min(512, len(train)), random_state=seed, n_jobs=-1,
         ).fit(scaler.transform(train))
 
         scores = {
@@ -1926,12 +2129,15 @@ def evaluate(
 
         near_fpr = fpr95(scores["id_val"], scores["near_ood"])
         far_fpr = fpr95(scores["id_val"], scores["far_ood"])
+        near_auc = auroc_pct(scores["id_val"], scores["near_ood"])
+        far_auc = auroc_pct(scores["id_val"], scores["far_ood"])
         per_class[class_name] = {
             "n_train": len(train),
             "n_id_val": n_id_val_raw, "n_id_val_kept": len(scores["id_val"]),
             "n_near_ood": len(near), "n_far_ood": len(far),
             "near_fpr95": near_fpr, "far_fpr95": far_fpr,
             "mean_fpr95": float(np.nanmean([near_fpr, far_fpr])),
+            "near_auroc": near_auc, "far_auroc": far_auc,
         }
         print(
             f"  {class_name:8s} near={near_fpr:6.2f}  far={far_fpr:6.2f}  "
@@ -1945,6 +2151,8 @@ def evaluate(
     far_fpr = fpr95(cat["id_val"], cat["far_ood"])
     finite = [x for x in (near_fpr, far_fpr) if np.isfinite(x)]
     mean_fpr = float(np.mean(finite)) if finite else float("nan")
+    near_auc = auroc_pct(cat["id_val"], cat["near_ood"])
+    far_auc = auroc_pct(cat["id_val"], cat["far_ood"])
     return {
         "method": "spk full" if KNN_COL in feature_cols else "spk local",
         "features": list(feature_cols),
@@ -1958,6 +2166,7 @@ def evaluate(
         "pooled": {
             "near_fpr95": near_fpr, "far_fpr95": far_fpr,
             "mean_fpr95": mean_fpr,
+            "near_auroc": near_auc, "far_auroc": far_auc,
             "n_id_val": len(cat["id_val"]),
             "n_near_ood": len(cat["near_ood"]), "n_far_ood": len(cat["far_ood"]),
         },
@@ -2085,13 +2294,8 @@ def build_native_knn_tables(
         flush=True,
     )
     tables: dict[str, pd.DataFrame] = {}
-    split_dirs = {
-        "id_train": NATIVE_ROOT / "id_train",
-        "id_val": NATIVE_ROOT / "id_val",
-        "near_ood": NATIVE_ROOT / "near_ood",
-        "far_ood": NATIVE_ROOT / "far_ood",
-    }
-    for data_source, native_dir in split_dirs.items():
+    for data_source in ROI_SPLITS:
+        native_dir = NATIVE_ROOT / data_source
         emb, names = load_native_embeddings(native_dir)
         table = score_classwise_native_knn(
             emb, names, train_emb, train_names, membership, class_names,
@@ -2120,9 +2324,149 @@ def load_saved_head(path: Path, device: str) -> tuple[ConceptHead, list[str]]:
 
 PATIENCE = 10
 SEED = 42
+SEEDS = (42, 43, 44)
+CANONICAL_OUTLIER = "without_outlier_removal"
+LEGACY_HEAD_FILES = ("activations.csv", "results.json", "timing.json")
 
 
-def train_and_eval(args: argparse.Namespace) -> None:
+def seed_dir(root: Path, seed: int) -> Path:
+    return root / f"seed_{seed}"
+
+
+def seed_everything(seed: int) -> None:
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def migrate_legacy_heads(out_root: Path, seed: int) -> None:
+    """Move flat concept_head_ood/*_head.pt into seed_{seed}/ (one-time layout change)."""
+    dest = seed_dir(out_root, seed)
+    if dest.is_dir() and any(dest.glob("*_head.pt")):
+        return
+    heads = sorted(p for p in out_root.glob("*_head.pt") if p.parent == out_root)
+    if not heads:
+        return
+    dest.mkdir(parents=True, exist_ok=True)
+    print(f"  migrating {len(heads)} legacy heads -> {dest}", flush=True)
+    for path in heads:
+        shutil.move(str(path), str(dest / path.name))
+    for name in LEGACY_HEAD_FILES:
+        src = out_root / name
+        if src.is_file():
+            shutil.move(str(src), str(dest / name))
+
+
+def _fmt_mean_std(values: list[float]) -> str:
+    arr = np.asarray([v for v in values if v is not None and np.isfinite(v)], dtype=np.float64)
+    if arr.size == 0:
+        return "nan"
+    std = float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0
+    return f"{float(np.mean(arr)):.2f} ± {std:.2f}"
+
+
+def write_seed_pool(out_root: Path, reports: dict[int, dict]) -> dict:
+    """Mean±std over head seeds. Headline protocol: no ID-val outlier removal."""
+    methods = ["spk local", "spk full"]
+    keys = ["near_fpr95", "far_fpr95", "mean_fpr95", "near_auroc", "far_auroc"]
+    table = []
+    print(
+        f"\n=== {len(reports)}-seed mean ± std (concept heads; outlier removal: none) ===",
+        flush=True,
+    )
+    print(
+        f"{'method':12s} {'near FPR95':14s} {'far FPR95':14s} "
+        f"{'near AUROC':14s} {'far AUROC':14s}",
+        flush=True,
+    )
+    for method_name in methods:
+        collected = {k: [] for k in keys}
+        for report in reports.values():
+            pooled = report["methods"][method_name][CANONICAL_OUTLIER]["pooled"]
+            for k in keys:
+                collected[k].append(pooled.get(k, float("nan")))
+        row = {
+            "method": method_name,
+            "outlier_removal": "none",
+            "seeds": sorted(reports),
+            **{k: _fmt_mean_std(collected[k]) for k in keys},
+        }
+        table.append(row)
+        print(
+            f"{method_name:12s} {row['near_fpr95']:14s} {row['far_fpr95']:14s} "
+            f"{row['near_auroc']:14s} {row['far_auroc']:14s}",
+            flush=True,
+        )
+    payload = {"outlier_removal": "none", "seeds": sorted(reports), "methods": table}
+    path = out_root / "pooled_mean_std.json"
+    path.write_text(json.dumps(payload, indent=2) + "\n")
+    print(f"wrote {path}", flush=True)
+    return payload
+
+
+def load_or_train_heads(args: argparse.Namespace) -> tuple[dict, list[str]]:
+    """逐类复用已保存的概念头，只训练缺失或要求重训的类别。"""
+    training_data = torch.load(
+        resolve_training_data(TRAINING_DATA), map_location="cpu", weights_only=False
+    )
+    class_names = args.classes or list(training_data)
+    missing = sorted(set(class_names) - set(training_data))
+    if missing:
+        raise SystemExit(f"classes not in training_data.pt: {missing}")
+
+    print(f"  {len(class_names)} class(es) on {args.device}")
+    heads = {}
+    n_reused = 0
+    for class_name in class_names:
+        head_path = args.out / f"{class_name}_head.pt"
+        if head_path.is_file() and not args.retrain:
+            head, concept_order = load_saved_head(head_path, args.device)
+            heads[class_name] = (head, concept_order)
+            n_reused += 1
+            print(f"  [{class_name}] reused {head_path.name} ({len(concept_order)} concepts)", flush=True)
+            continue
+        x, y, concept_order, groups = build_class_data(training_data, class_name)
+        print(f"  [{class_name}] {len(x):,} ROIs, {len(concept_order)} concepts", flush=True)
+        head = train_head(class_name, x, y, groups, args)
+        heads[class_name] = (head, concept_order)
+        torch.save({"state_dict": head.state_dict(), "concept_order": concept_order,
+                    "class_name": class_name, "seed": int(args.seed)}, head_path)
+        del x, y
+    print(f"  heads: reused {n_reused}/{len(class_names)}, trained {len(class_names) - n_reused}", flush=True)
+    del training_data
+
+    return heads, class_names
+
+
+def score_all_roi_caches(heads: dict, args: argparse.Namespace) -> pd.DataFrame:
+    """依次评分四个数据划分，再合并为一张表。"""
+    print("  scoring cached ROIs")
+    frames = []
+    score_batch = max(
+        (tune_head_batch(head.stem[0].weight.shape[1], head.head.weight.shape[0], args)
+         for head, _ in heads.values()),
+        default=HEAD_BATCH,
+    )
+    for split_name, filename in ROI_SPLITS.items():
+        frame = score_roi_cache(
+            ROI_DIR / filename, split_name, heads, args.device, batch_size=score_batch,
+        )
+        print(f"  {split_name}: {len(frame):,} ROIs", flush=True)
+        if not frame.empty:
+            print(f"    {frame['class'].value_counts().to_dict()}", flush=True)
+        frames.append(frame)
+    activations = pd.concat(frames, ignore_index=True)
+    print(
+        "  scored class x split:\n"
+        f"{activations.groupby(['data_source', 'class']).size().unstack(fill_value=0)}",
+        flush=True,
+    )
+    return activations
+
+
+def load_or_score_activations(args: argparse.Namespace) -> tuple[pd.DataFrame, list[str]]:
+    """已有评分时直接读取；否则准备概念头并对 ROI 缓存评分。"""
     activations_path = args.out / "activations.csv"
     if args.retrain:
         args.rescore = True
@@ -2134,58 +2478,13 @@ def train_and_eval(args: argparse.Namespace) -> None:
         class_names = args.classes or [c for c in PROFILE.label_classes if c in present]
         print(f"  reused {activations_path} ({len(activations):,} rows, {len(class_names)} classes)", flush=True)
     else:
-        training_data = torch.load(
-            resolve_training_data(TRAINING_DATA), map_location="cpu", weights_only=False
-        )
-        class_names = args.classes or list(training_data)
-        missing = sorted(set(class_names) - set(training_data))
-        if missing:
-            raise SystemExit(f"classes not in training_data.pt: {missing}")
+        heads, class_names = load_or_train_heads(args)
+        activations = score_all_roi_caches(heads, args)
+    return activations, class_names
 
-        print(f"  {len(class_names)} class(es) on {args.device}")
-        heads = {}
-        n_reused = 0
-        for class_name in class_names:
-            head_path = args.out / f"{class_name}_head.pt"
-            if head_path.is_file() and not args.retrain:
-                head, concept_order = load_saved_head(head_path, args.device)
-                heads[class_name] = (head, concept_order)
-                n_reused += 1
-                print(f"  [{class_name}] reused {head_path.name} ({len(concept_order)} concepts)", flush=True)
-                continue
-            x, y, concept_order, groups = build_class_data(training_data, class_name)
-            print(f"  [{class_name}] {len(x):,} ROIs, {len(concept_order)} concepts", flush=True)
-            head = train_head(class_name, x, y, groups, args)
-            heads[class_name] = (head, concept_order)
-            torch.save({"state_dict": head.state_dict(), "concept_order": concept_order,
-                        "class_name": class_name}, head_path)
-            del x, y
-        print(f"  heads: reused {n_reused}/{len(class_names)}, trained {len(class_names) - n_reused}", flush=True)
-        del training_data
 
-        print("  scoring cached ROIs")
-        frames = []
-        score_batch = max(
-            (tune_head_batch(head.stem[0].weight.shape[1], head.head.weight.shape[0], args)
-             for head, _ in heads.values()),
-            default=HEAD_BATCH,
-        )
-        for split_name, filename in ROI_SPLITS.items():
-            frame = score_roi_cache(
-                ROI_DIR / filename, split_name, heads, args.device, batch_size=score_batch,
-            )
-            print(f"  {split_name}: {len(frame):,} ROIs", flush=True)
-            if not frame.empty:
-                print(f"    {frame['class'].value_counts().to_dict()}", flush=True)
-            frames.append(frame)
-        activations = pd.concat(frames, ignore_index=True)
-        del heads
-        print(
-            "  scored class x split:\n"
-            f"{activations.groupby(['data_source', 'class']).size().unstack(fill_value=0)}",
-            flush=True,
-        )
-
+def prepare_knn_activations(activations, class_names, args):
+    """筛出训练集真阳性，并把图像级 kNN 距离附到每个检测框。"""
     print("  ensuring image-level native embeddings")
     ensure_native_embeddings(args)
 
@@ -2199,14 +2498,19 @@ def train_and_eval(args: argparse.Namespace) -> None:
             "leftover). Delete it or let stage A rebuild data/id/gt_{dataset}.json."
         )
 
-    knn_tables = build_native_knn_tables(id_train_tp, class_names)
+    if getattr(args, "_knn_tables", None) is None:
+        args._knn_tables = build_native_knn_tables(id_train_tp, class_names)
+    knn_tables = args._knn_tables
     tp_index = id_train_tp.index
     activations = attach_native_knn(activations, knn_tables)
     id_train_tp = activations.loc[tp_index]
     n_knn = int(activations[KNN_COL].notna().sum())
     print(f"  attached {KNN_COL} to {n_knn:,}/{len(activations):,} activation rows", flush=True)
-    activations.to_csv(activations_path, index=False)
+    return activations, id_train_tp
 
+
+def evaluate_methods(activations, class_names, id_train_tp, args) -> dict:
+    """分别评估 local/full，以及保留/移除 ID-val 异常值两种设置。"""
     methods = [
         ("spk local", SPK4_COLS),
         ("spk full", SPK4_COLS + [KNN_COL]),
@@ -2237,6 +2541,7 @@ def train_and_eval(args: argparse.Namespace) -> None:
             print(f"\n=== {method_name}  features={feature_cols}  id_val outlier removal: {label} ===")
             result = evaluate(
                 activations, class_names, id_train_tp, feature_cols, drop_id_val_outliers=drop,
+                seed=int(args.seed),
             )
             pooled = result["pooled"]
             print(
@@ -2256,6 +2561,15 @@ def train_and_eval(args: argparse.Namespace) -> None:
                 f"{pooled['near_fpr95']:8.2f} {pooled['far_fpr95']:8.2f} {pooled['mean_fpr95']:8.2f}"
             )
 
+    return report
+
+
+def train_and_eval(args: argparse.Namespace) -> dict:
+    """阶段 C：准备评分 → 添加 kNN 特征 → 评估 → 保存结果。"""
+    activations, class_names = load_or_score_activations(args)
+    activations, id_train_tp = prepare_knn_activations(activations, class_names, args)
+    activations.to_csv(args.out / "activations.csv", index=False)
+    report = evaluate_methods(activations, class_names, id_train_tp, args)
     (args.out / "results.json").write_text(json.dumps(report, indent=2) + "\n")
     print(f"wrote {args.out}/results.json and {args.out}/activations.csv")
     return report
@@ -2264,15 +2578,25 @@ def train_and_eval(args: argparse.Namespace) -> None:
 def _planned_classes(args: argparse.Namespace) -> list[str]:
     if args.classes:
         return list(args.classes)
-    return list(PROFILE.label_classes)
+    try:
+        bundle = torch.load(
+            resolve_training_data(TRAINING_DATA), map_location="cpu", weights_only=False
+        )
+    except (FileNotFoundError, IsADirectoryError, OSError):
+        return list(PROFILE.label_classes)
+    per_class = bundle.get("per_class", bundle) if isinstance(bundle, dict) else {}
+    if not isinstance(per_class, dict) or not per_class:
+        return list(PROFILE.label_classes)
+    ordered = [c for c in PROFILE.label_classes if c in per_class]
+    ordered += [c for c in per_class if c not in ordered]
+    return ordered
 
 
 def print_skip_plan(args: argparse.Namespace) -> None:
     """Say which stages will run vs reuse files already under --root."""
     classes = _planned_classes(args)
-    heads_ok = [c for c in classes if (args.out / f"{c}_head.pt").is_file()]
-    heads_miss = [c for c in classes if c not in heads_ok]
-    activations_path = args.out / "activations.csv"
+    out_root = getattr(args, "out_root", args.out)
+    seeds = list(getattr(args, "seeds", [getattr(args, "seed", SEED)]))
     print("=== skip plan (--force / --retrain / --rescore to override) ===", flush=True)
     print(
         f"  A  GT index           {'skip' if gt_index_is_current(GT_INDEX, DATASET_DIR) else f'run   ({GT_INDEX.name})'}",
@@ -2298,34 +2622,31 @@ def print_skip_plan(args: argparse.Namespace) -> None:
         b_bits.append(
             f"{split}:skip({stats.get('num_images')} img, {stats.get('num_detections')} det)"
         )
-    if b_run:
-        print(f"  B  ROI extraction     run   ({'; '.join(b_bits)})", flush=True)
-    else:
-        print(f"  B  ROI extraction     skip  ({'; '.join(b_bits)})", flush=True)
+    status = "run " if b_run else "skip"
+    print(f"  B  ROI extraction     {status}  ({'; '.join(b_bits)})", flush=True)
     native_miss = [split for split in SPLITS if not native_ready(native_split_dir(split))]
     if native_miss:
         print(f"  C  native embeddings  run   (missing {native_miss})", flush=True)
     else:
         print("  C  native embeddings  skip  (chunks on disk)", flush=True)
-    if args.retrain:
-        print(f"  C  concept heads      run   (retrain {len(classes)} classes)", flush=True)
-    elif heads_miss:
-        print(
-            f"  C  concept heads      run   (train {heads_miss}; reuse {heads_ok or 'none'})",
-            flush=True,
-        )
-    else:
-        print(
-            f"  C  concept heads      skip  ({len(heads_ok)}/{len(classes)} *_head.pt)",
-            flush=True,
-        )
-    if args.rescore or args.retrain:
-        print("  C  ROI scoring        run", flush=True)
-    elif activations_path.is_file():
-        print(f"  C  ROI scoring        skip  ({activations_path.name} exists)", flush=True)
-    else:
-        print("  C  ROI scoring        run   (no activations.csv; heads reused if present)", flush=True)
-    print("  C  FPR95 eval         run", flush=True)
+    print(f"  C  head seeds         {seeds}", flush=True)
+    for seed in seeds:
+        seed_out = seed_dir(out_root, seed)
+        heads_ok = [c for c in classes if (seed_out / f"{c}_head.pt").is_file()]
+        heads_miss = [c for c in classes if c not in heads_ok]
+        activations_path = seed_out / "activations.csv"
+        if args.retrain:
+            head_plan = f"retrain {len(classes)} classes"
+        elif heads_miss:
+            head_plan = f"train {heads_miss}; reuse {heads_ok or 'none'}"
+        else:
+            head_plan = f"skip ({len(heads_ok)}/{len(classes)} *_head.pt)"
+        if args.rescore or args.retrain or not activations_path.is_file():
+            score_plan = "run"
+        else:
+            score_plan = f"skip ({activations_path.name} exists)"
+        print(f"    seed {seed}: heads {head_plan}; score {score_plan}", flush=True)
+    print("  C  FPR95 eval         run   (per seed; pooled mean±std, outlier=none)", flush=True)
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -2339,13 +2660,14 @@ def _fmt_duration(seconds: float) -> str:
     return f"{seconds:.1f}s"
 
 
-def main() -> None:
+def parse_args() -> argparse.Namespace:
+    """读取命令行参数，并按所选数据集补齐默认值。"""
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--detector", choices=("yolo", "frcnn"), default="yolo",
-                        help="yolo or frcnn (checkpoint, ROI channels, native pooling)")
+    parser.add_argument("--detector", choices=("yolo", "frcnn", "rtdetr"), default="yolo",
+                        help="yolo, frcnn, or rtdetr (checkpoint, ROI channels, native pooling)")
     parser.add_argument("--dataset", choices=("voc", "bdd"), default="voc",
                         help="voc or bdd (tar prefixes, classes)")
     parser.add_argument("--root", type=Path, default=None,
@@ -2376,7 +2698,9 @@ def main() -> None:
     parser.add_argument("--head-batch", type=int, default=0,
                         help="Stage C head train/score batch; 0 = auto from --vram-frac")
     parser.add_argument("--seed", type=int, default=SEED,
-                        help="RNG seed for concept-head training (default: 42)")
+                        help="Single concept-head seed (default: 42)")
+    parser.add_argument("--seeds", nargs="+", type=int, default=None,
+                        help="Run several concept-head seeds (e.g. --seeds 42 43 44)")
     args = parser.parse_args()
     set_profile(args.detector, args.dataset)
     if args.root is not None:
@@ -2392,14 +2716,21 @@ def main() -> None:
                 f"unknown --splits {unknown} for --detector {args.detector} "
                 f"--dataset {args.dataset} (choose from {list(SPLITS)})"
             )
+    if args.seeds:
+        args.seeds = [int(s) for s in args.seeds]
+    else:
+        args.seeds = [int(args.seed)]
+    args.seed = int(args.seeds[0])
     if args.out is None:
         args.out = ARCH_DIR / "concept_head_ood"
+    args.out_root = args.out
+    return args
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-    args.out.mkdir(parents=True, exist_ok=True)
+
+def main() -> None:
+    args = parse_args()
+    args.out_root.mkdir(parents=True, exist_ok=True)
+    migrate_legacy_heads(args.out_root, args.seeds[0])
 
     if not CHECKPOINT.is_file():
         raise FileNotFoundError(CHECKPOINT)
@@ -2410,14 +2741,15 @@ def main() -> None:
 
     args.extract_batch_resolved = int(args.extract_batch) if args.extract_batch > 0 else 0
     args._head_batch_cache = {}
+    args._knn_tables = None
     print(
         f"detector={PROFILE.detector}  dataset={PROFILE.name}  root={ROOT}\n"
         f"  checkpoint={CHECKPOINT}\n"
         f"  training={TRAINING_DATA}\n"
         f"  roi={ROI_DIR}\n"
-        f"  out={args.out}\n"
+        f"  out={args.out_root}/seed_{{s}}\n"
         f"  max_det={PROFILE.max_det}  roi_ch={PROFILE.feature_channels}  "
-        f"vram_frac={args.vram_frac:.0%}  seed={args.seed}",
+        f"vram_frac={args.vram_frac:.0%}  seeds={list(args.seeds)}",
         flush=True,
     )
     print_skip_plan(args)
@@ -2440,11 +2772,8 @@ def main() -> None:
     engine = None
     summaries = []
     for split in args.splits:
-        need_roi, need_native, need_prior = split_needs_extract(split, args)
-        if not need_roi and not need_native and not need_prior:
-            summaries.append(extract_split(split, None, args))
-            continue
-        if engine is None:
+        # 只有需要重新提取时才加载模型；已有缓存由 extract_split 直接复用。
+        if any(split_needs_extract(split, args)) and engine is None:
             engine = build_engine(args.device)
             _ensure_extract_batch(engine, args)
         summaries.append(extract_split(split, engine, args))
@@ -2464,22 +2793,35 @@ def main() -> None:
 
     print("=== [C] concept heads + OOD eval ===")
     t0 = time.perf_counter()
-    results = train_and_eval(args)
+    seed_reports: dict[int, dict] = {}
+    seed_times: dict[str, float] = {}
+    for seed in args.seeds:
+        args.seed = int(seed)
+        args.out = seed_dir(args.out_root, seed)
+        args.out.mkdir(parents=True, exist_ok=True)
+        seed_everything(seed)
+        print(f"\n----- seed {seed} -> {args.out} -----", flush=True)
+        t_seed = time.perf_counter()
+        seed_reports[seed] = train_and_eval(args)
+        seed_times[f"C_seed_{seed}"] = time.perf_counter() - t_seed
+        print(f"  seed {seed} wall {_fmt_duration(seed_times[f'C_seed_{seed}'])}", flush=True)
+    timings.update(seed_times)
     timings["C_train_eval"] = time.perf_counter() - t0
     timings["total"] = time.perf_counter() - t_all
     print(f"  stage C wall {_fmt_duration(timings['C_train_eval'])}")
+    if len(seed_reports) > 1:
+        write_seed_pool(args.out_root, seed_reports)
 
     print("\n=== wall-clock ===")
     print(f"  A  GT index        {_fmt_duration(timings['A_gt_index'])}")
     print(f"  B  ROI extract     {_fmt_duration(timings['B_roi_extract'])}")
+    for seed in args.seeds:
+        print(f"  C  seed {seed}        {_fmt_duration(seed_times[f'C_seed_{seed}'])}")
     print(f"  C  train+eval      {_fmt_duration(timings['C_train_eval'])}")
     print(f"  total              {_fmt_duration(timings['total'])}")
 
-    timing_path = args.out / "timing.json"
+    timing_path = args.out_root / "timing.json"
     timing_path.write_text(json.dumps(timings, indent=2) + "\n")
-    if isinstance(results, dict):
-        results["timing_sec"] = timings
-        (args.out / "results.json").write_text(json.dumps(results, indent=2) + "\n")
     print(f"wrote {timing_path}")
 
 
