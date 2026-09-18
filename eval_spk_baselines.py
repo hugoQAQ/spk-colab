@@ -9,6 +9,7 @@ Typical Colab flow:
 Paths default to ``<root>/data/{detector}/{dataset}/``:
   concept_head_ood/seed_42/activations.csv  (or a flat activations.csv)
   -> spk_baselines/
+  -> MyDrive/experiments/{detector}-{dataset}/spk_variants/  (auto backup)
 GT index: ``<root>/data/id/gt_{dataset}.json`` (built by run.py stage A).
 """
 from __future__ import annotations
@@ -16,6 +17,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import shutil
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +34,7 @@ SPK_METHODS = ["MDS", "BAM", "KNN", "iForest"]
 DISPLAY_NAME = {"MDS": "SPK MDS", "BAM": "SPK BAM", "KNN": "SPK KNN", "iForest": "SPK IF"}
 SEEDS = (42,)
 DEFAULT_ROOT = Path("/content/spk")
+EXPERIMENTS_DRIVE_DEFAULT = Path("/content/drive/MyDrive/experiments")
 DEFAULT_BAM_DENSITY_SWEEP = (1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0)
 
 SPLIT_MAP = {
@@ -213,6 +216,76 @@ def seed_jobs(args: argparse.Namespace) -> list[tuple[int, Path]]:
     if args.activations is None:
         raise SystemExit("need --detector/--dataset, --activations, or --seed-root")
     return [(int(seed), args.activations) for seed in args.seeds]
+
+
+def resolve_experiments_root(args: argparse.Namespace) -> Path | None:
+    if args.no_backup:
+        return None
+    if args.experiments_dir is not None:
+        root = args.experiments_dir.expanduser().resolve()
+    elif EXPERIMENTS_DRIVE_DEFAULT.is_dir():
+        root = EXPERIMENTS_DRIVE_DEFAULT
+    else:
+        return None
+    if not root.is_dir():
+        print(f"  backup skipped: {root} is not a directory", flush=True)
+        return None
+    return root
+
+
+def experiment_subdir(experiments_root: Path, detector: str, dataset: str) -> Path:
+    return experiments_root / f"{detector}-{dataset}"
+
+
+def _human_bytes(n: int) -> str:
+    size = float(max(n, 0))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024.0 or unit == "TB":
+            if unit == "B":
+                return f"{int(size)}{unit}"
+            return f"{size:.1f}{unit}"
+        size /= 1024.0
+    return f"{size:.1f}TB"
+
+
+def _sync_into(src: Path, dest: Path) -> tuple[int, int]:
+    """Copy file or directory contents into dest (never dest/src.name nesting)."""
+    if not src.exists():
+        return 0, 0
+    dest.mkdir(parents=True, exist_ok=True)
+    copied, nbytes = 0, 0
+    paths = [src] if src.is_file() else sorted(p for p in src.rglob("*") if p.is_file())
+    for path in paths:
+        rel = path.name if src.is_file() else path.relative_to(src)
+        out = dest / rel
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if out.is_file():
+            src_stat, dst_stat = path.stat(), out.stat()
+            if src_stat.st_size == dst_stat.st_size and src_stat.st_mtime <= dst_stat.st_mtime:
+                continue
+        shutil.copy2(path, out)
+        copied += 1
+        nbytes += path.stat().st_size
+    return copied, nbytes
+
+
+def backup_spk_variants(experiments_root: Path, args: argparse.Namespace) -> None:
+    """Sync local spk_baselines/ into experiments/{detector}-{dataset}/spk_variants/."""
+    if not args.detector or not args.dataset:
+        print("  backup spk_variants: skip (need --detector and --dataset)", flush=True)
+        return
+    if not args.out.is_dir() or not any(args.out.rglob("*")):
+        print(f"  backup spk_variants: skip (empty {args.out})", flush=True)
+        return
+    dest = experiment_subdir(experiments_root, args.detector, args.dataset) / "spk_variants"
+    copied, nbytes = _sync_into(args.out, dest)
+    if copied:
+        print(
+            f"  backup spk_variants: {copied} file(s), {_human_bytes(nbytes)} -> {dest}",
+            flush=True,
+        )
+    else:
+        print(f"  backup spk_variants: up to date at {dest}", flush=True)
 
 
 def make_baseline_args(args: argparse.Namespace, seed: int, bam_density: float | None = None) -> SimpleNamespace:
@@ -502,15 +575,40 @@ def main() -> int:
                         help="Which seed_* dirs / RNG seeds to use (default: 42 only)")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument(
+        "--experiments-dir",
+        type=Path,
+        default=None,
+        help="Drive experiments root for spk_variants backup "
+             "(default: /content/drive/MyDrive/experiments when mounted)",
+    )
+    parser.add_argument(
+        "--no-backup",
+        action="store_true",
+        help="Do not copy results to experiments/{detector}-{dataset}/spk_variants/",
+    )
     args = parser.parse_args()
     if args.seed is not None:
         args.seeds = [args.seed]
     resolve_bundle(args)
+    experiments_root = resolve_experiments_root(args)
+    if experiments_root is not None and args.detector and args.dataset:
+        dest = experiment_subdir(experiments_root, args.detector, args.dataset) / "spk_variants"
+        print(f"  experiments backup -> {dest}/", flush=True)
+    elif not args.no_backup:
+        print(
+            "  experiments backup disabled (mount Drive or pass --experiments-dir; --no-backup to silence)",
+            flush=True,
+        )
     with threadpool_limits(limits=args.jobs):
         if args.sweep_bam_density is not None:
             args.sweep_bam_density = args.sweep_bam_density or list(DEFAULT_BAM_DENSITY_SWEEP)
-            return run_bam_density_sweep(args)
-        return run_eval(args)
+            code = run_bam_density_sweep(args)
+        else:
+            code = run_eval(args)
+    if experiments_root is not None:
+        backup_spk_variants(experiments_root, args)
+    return code
 
 
 if __name__ == "__main__":
