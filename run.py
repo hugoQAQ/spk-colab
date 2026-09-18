@@ -15,7 +15,9 @@ Four stages, run in order:
 
 Default is one concept-head seed (42). Pass `--seeds 42 43 44` for a 3-seed
 run (stage A/B once; stage C retrains and rescores per seed, then mean±std).
-Headline FPR95 / AUROC tables use no ID-val outlier removal.
+Headline FPR95 / AUROC tables use no ID-val outlier removal. Optional spk_knn
+mode drops each class's highest 5% ID-val kNN distances fit on standardized SPK4
+(see --id-val-outlier-modes).
 
 Checkpoints live under model/{detector}/ so one Colab session can hold YOLO, FRCNN, and RT-DETR.
 Image tars under data/id and data/ood are shared across detectors.
@@ -74,6 +76,7 @@ import torch.nn.functional as F
 from PIL import Image
 from sklearn.ensemble import IsolationForest
 from sklearn.metrics import roc_auc_score
+from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 from torchvision.ops import nms, roi_align
@@ -360,6 +363,14 @@ KNN_COL = "native_knn"
 SPK_FULL_COLS = SPK4_COLS + [KNN_COL]
 NATIVE_K = 5
 ID_VAL_OUTLIER_FRACTION = 0.05
+ID_VAL_OUTLIER_MODES = ("none", "iforest", "spk_knn")
+ID_VAL_OUTLIER_SETTING = {
+    "none": "without_outlier_removal",
+    "iforest": "with_outlier_removal",
+    "spk_knn": "with_spk_knn_outlier_removal",
+}
+SPK_KNN_OUTLIER_COLS = SPK4_COLS
+SPK_OUTLIER_KNN_K = 5
 
 # ROI caches consumed by stage C, and the split name we give each one.
 ROI_SPLITS = {
@@ -1737,6 +1748,22 @@ def unpack_features(block: dict) -> torch.Tensor:
     return block["features"].float()
 
 
+def training_data_classes(bundle: dict) -> list[str]:
+    """Class names in semantic training_data (flat or per_class + metadata wrapper)."""
+    if not isinstance(bundle, dict):
+        return []
+    per_class = bundle.get("per_class", bundle)
+    if not isinstance(per_class, dict):
+        return []
+    names = [
+        name for name, entry in per_class.items()
+        if isinstance(entry, dict) and "id" in entry
+    ]
+    ordered = [c for c in PROFILE.label_classes if c in names]
+    ordered += [c for c in names if c not in ordered]
+    return ordered
+
+
 def bundle_feature_channels(bundle: dict) -> int | None:
     """Channel dim of the first feature block in training_data.pt."""
     per_class = bundle.get("per_class", bundle)
@@ -2156,25 +2183,95 @@ def drop_lowest_id_val(scores: np.ndarray, fraction: float = ID_VAL_OUTLIER_FRAC
     return np.sort(scores)[drop:]
 
 
+def spk_knn_mean_distances(train: np.ndarray, query: np.ndarray, k: int) -> np.ndarray:
+    """Mean Euclidean kNN distance in standardized SPK4 space (m-hood style)."""
+    if len(train) == 0 or len(query) == 0:
+        return np.zeros(len(query), dtype=np.float64)
+    scaler = StandardScaler().fit(train)
+    bank = scaler.transform(train)
+    q = scaler.transform(query)
+    use_k = max(1, min(int(k), len(bank)))
+    nn = NearestNeighbors(n_neighbors=use_k, metric="euclidean", n_jobs=-1).fit(bank)
+    return nn.kneighbors(q, return_distance=True)[0].mean(axis=1)
+
+
+def drop_highest_id_val_knn(
+    scores: np.ndarray, knn_dist: np.ndarray, fraction: float = ID_VAL_OUTLIER_FRACTION,
+) -> np.ndarray:
+    """Drop ID-val rows with the largest SPK kNN distance (farther from ID-train)."""
+    if len(scores) != len(knn_dist):
+        raise ValueError(f"scores/knn length mismatch: {len(scores)} vs {len(knn_dist)}")
+    drop = min(int(np.floor(fraction * len(scores))), max(len(scores) - 5, 0))
+    if drop <= 0:
+        return scores
+    keep = np.ones(len(scores), dtype=bool)
+    keep[np.argsort(knn_dist)[-drop:]] = False
+    return scores[keep]
+
+
+def id_val_outlier_filter_label(mode: str) -> str:
+    if mode == "iforest":
+        return "drop each class's lowest 5% Isolation Forest scores"
+    if mode == "spk_knn":
+        return (
+            "drop each class's highest 5% SPK kNN distances "
+            f"(m-hood Euclidean kNN on standardized {SPK_KNN_OUTLIER_COLS}; "
+            "same geometry as stage-D KNN on SPK4, not native image embeddings)"
+        )
+    return "none (all ID-val detections of the predicted class)"
+
+
+def class_split_features(
+    frame: pd.DataFrame,
+    class_name: str,
+    feature_cols: list[str],
+    *,
+    spk_outlier_cols: list[str] | None = None,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    part = frame.loc[frame["class"] == class_name]
+    check_cols = list(dict.fromkeys(feature_cols + (spk_outlier_cols or [])))
+    mask = np.isfinite(part[check_cols].to_numpy(dtype=np.float64)).all(axis=1)
+    part = part.loc[mask]
+    x = part[feature_cols].to_numpy(dtype=np.float64)
+    spk = part[spk_outlier_cols].to_numpy(dtype=np.float64) if spk_outlier_cols else None
+    return x, spk
+
+
 def evaluate(
     activations: pd.DataFrame,
     class_names: list[str],
     id_train_tp: pd.DataFrame,
     feature_cols: list[str],
-    drop_id_val_outliers: bool,
+    outlier_mode: str = "none",
     seed: int = 42,
+    spk_knn_k: int = SPK_OUTLIER_KNN_K,
 ) -> dict:
     """One Isolation Forest per class; report per-class and pooled FPR95 / AUROC."""
+    if outlier_mode not in ID_VAL_OUTLIER_MODES:
+        raise ValueError(f"unknown outlier_mode {outlier_mode!r}")
     per_class, pooled = {}, {"id_val": [], "near_ood": [], "far_ood": []}
 
+    spk_outlier_cols = SPK_KNN_OUTLIER_COLS if outlier_mode == "spk_knn" else None
+    id_val_frame = activations[activations["data_source"] == "id_val"]
     for class_name in class_names:
-        def split(frame: pd.DataFrame) -> np.ndarray:
-            return frame.loc[frame["class"] == class_name, feature_cols].dropna().to_numpy()
-
-        train = split(id_train_tp)
-        id_val = split(activations[activations["data_source"] == "id_val"])
-        near = split(activations[activations["data_source"] == "near_ood"])
-        far = split(activations[activations["data_source"] == "far_ood"])
+        train, train_spk = class_split_features(
+            id_train_tp, class_name, feature_cols, spk_outlier_cols=spk_outlier_cols,
+        )
+        id_val, id_val_spk = class_split_features(
+            id_val_frame, class_name, feature_cols, spk_outlier_cols=spk_outlier_cols,
+        )
+        near, _ = class_split_features(
+            activations[activations["data_source"] == "near_ood"],
+            class_name,
+            feature_cols,
+            spk_outlier_cols=spk_outlier_cols,
+        )
+        far, _ = class_split_features(
+            activations[activations["data_source"] == "far_ood"],
+            class_name,
+            feature_cols,
+            spk_outlier_cols=spk_outlier_cols,
+        )
         if len(train) < 5 or len(id_val) < 5:
             per_class[class_name] = {
                 "skipped": True,
@@ -2189,24 +2286,34 @@ def evaluate(
                 flush=True,
             )
             continue
+        train_for_if = train
+        train_spk_for_knn = train_spk
         if len(train) > 1500:  # cap keeps fitting fast; 1500 is plenty for 4-5 features
-            train = train[np.random.default_rng(seed).choice(len(train), 1500, replace=False)]
+            keep = np.random.default_rng(seed).choice(len(train), 1500, replace=False)
+            train_for_if = train[keep]
+            if train_spk is not None:
+                train_spk_for_knn = train_spk[keep]
 
-        scaler = StandardScaler().fit(train)
+        scaler = StandardScaler().fit(train_for_if)
         forest = IsolationForest(
             n_estimators=200, contamination=0.05,
             max_samples=min(512, len(train)), random_state=seed, n_jobs=-1,
-        ).fit(scaler.transform(train))
+        ).fit(scaler.transform(train_for_if))
 
         scores = {
             name: forest.decision_function(scaler.transform(data)) if len(data) else np.zeros(0)
             for name, data in [("id_val", id_val), ("near_ood", near), ("far_ood", far)]
         }
         # ID-val also contains detector mistakes. We have no ground truth for it,
-        # so optionally drop the 5% the forest itself finds least ID-like.
+        # so optionally drop the least ID-like 5% (IF scores or SPK4 kNN distance).
         n_id_val_raw = len(scores["id_val"])
-        if drop_id_val_outliers:
+        if outlier_mode == "iforest":
             scores["id_val"] = drop_lowest_id_val(scores["id_val"])
+        elif outlier_mode == "spk_knn":
+            if id_val_spk is None or train_spk_for_knn is None:
+                raise ValueError(f"{class_name}: missing aligned SPK4 rows for spk_knn outlier removal")
+            knn_dist = spk_knn_mean_distances(train_spk_for_knn, id_val_spk, spk_knn_k)
+            scores["id_val"] = drop_highest_id_val_knn(scores["id_val"], knn_dist)
         for name in pooled:
             pooled[name].append(scores[name])
 
@@ -2241,10 +2348,8 @@ def evaluate(
         "features": list(feature_cols),
         "ood_protocol": "near_far_ood",
         "id_train_filter": "same predicted class and IoU >= 0.5 with ground truth",
-        "id_val_filter": (
-            "drop each class's lowest 5% Isolation Forest scores"
-            if drop_id_val_outliers else "none (all ID-val detections of the predicted class)"
-        ),
+        "id_val_outlier_mode": outlier_mode,
+        "id_val_filter": id_val_outlier_filter_label(outlier_mode),
         "per_class": per_class,
         "pooled": {
             "near_fpr95": near_fpr, "far_fpr95": far_fpr,
@@ -2864,10 +2969,13 @@ def load_or_train_heads(args: argparse.Namespace) -> tuple[dict, list[str]]:
     training_data = torch.load(
         resolve_training_data(TRAINING_DATA), map_location="cpu", weights_only=False
     )
-    class_names = args.classes or list(training_data)
-    missing = sorted(set(class_names) - set(training_data))
+    available = training_data_classes(training_data)
+    class_names = args.classes or available
+    missing = sorted(set(class_names) - set(available))
     if missing:
         raise SystemExit(f"classes not in training_data.pt: {missing}")
+    if not class_names:
+        raise SystemExit("training_data.pt has no class entries with an id block")
 
     print(f"  {len(class_names)} class(es) on {args.device}")
     roi_ch = first_roi_channels()
@@ -2982,21 +3090,32 @@ def prepare_knn_activations(activations, class_names, args):
 
 
 def evaluate_methods(activations, class_names, id_train_tp, args) -> dict:
-    """分别评估 local/full，以及保留/移除 ID-val 异常值两种设置。"""
+    """Evaluate spk local/full under each requested ID-val outlier-removal mode."""
     methods = [
         ("spk local", SPK4_COLS),
         ("spk full", SPK4_COLS + [KNN_COL]),
     ]
-    outlier_settings = [
-        ("without_outlier_removal", False),
-        ("with_outlier_removal", True),
-    ]
+    outlier_modes = list(dict.fromkeys(args.id_val_outlier_modes))
+    unknown = [m for m in outlier_modes if m not in ID_VAL_OUTLIER_MODES]
+    if unknown:
+        raise SystemExit(f"unknown --id-val-outlier-modes {unknown} (choose from {list(ID_VAL_OUTLIER_MODES)})")
+    missing_spk = [c for c in SPK_KNN_OUTLIER_COLS if c not in activations.columns]
+    if "spk_knn" in outlier_modes and missing_spk:
+        raise SystemExit(
+            f"--id-val-outlier-modes spk_knn requires SPK columns {missing_spk} in activations.csv"
+        )
     report: dict[str, Any] = {
         "dataset": PROFILE.name,
         "detector": PROFILE.detector,
         "seed": int(args.seed),
         "ood_protocol": "near_far_ood",
         "id_train_filter": "same predicted class and IoU >= 0.5 with ground truth",
+        "id_val_outlier_modes": outlier_modes,
+        "spk_knn_outlier": {
+            "feature_cols": list(SPK_KNN_OUTLIER_COLS),
+            "k": int(args.id_val_outlier_knn_k),
+            "distance": "mean Euclidean distance to k nearest ID-train TP rows (StandardScaler + m-hood)",
+        },
         "native_knn": {
             "column": KNN_COL,
             "k": NATIVE_K,
@@ -3008,28 +3127,34 @@ def evaluate_methods(activations, class_names, id_train_tp, args) -> dict:
     print("  FPR95 (lower is better)")
     for method_name, feature_cols in methods:
         report["methods"][method_name] = {}
-        for setting_name, drop in outlier_settings:
-            label = "drop_lowest_5pct" if drop else "none"
-            print(f"\n=== {method_name}  features={feature_cols}  id_val outlier removal: {label} ===")
+        for mode in outlier_modes:
+            setting_name = ID_VAL_OUTLIER_SETTING[mode]
+            print(
+                f"\n=== {method_name}  features={feature_cols}  "
+                f"id_val outlier removal: {mode} ===",
+                flush=True,
+            )
             result = evaluate(
-                activations, class_names, id_train_tp, feature_cols, drop_id_val_outliers=drop,
-                seed=int(args.seed),
+                activations, class_names, id_train_tp, feature_cols,
+                outlier_mode=mode, seed=int(args.seed),
+                spk_knn_k=int(args.id_val_outlier_knn_k),
             )
             pooled = result["pooled"]
             print(
                 f"pooled  near={pooled['near_fpr95']:.2f}  far={pooled['far_fpr95']:.2f}  "
-                f"mean={pooled['mean_fpr95']:.2f}"
+                f"mean={pooled['mean_fpr95']:.2f}",
+                flush=True,
             )
             report["methods"][method_name][setting_name] = result
 
     print("\n=== pooled summary ===")
-    print(f"{'method':12s} {'outlier_removal':20s} {'near':8s} {'far':8s} {'mean':8s}")
+    print(f"{'method':12s} {'outlier_mode':20s} {'near':8s} {'far':8s} {'mean':8s}")
     for method_name, _ in methods:
-        for setting_name, drop in outlier_settings:
+        for mode in outlier_modes:
+            setting_name = ID_VAL_OUTLIER_SETTING[mode]
             pooled = report["methods"][method_name][setting_name]["pooled"]
-            label = "drop_lowest_5pct" if drop else "none"
             print(
-                f"{method_name:12s} {label:20s} "
+                f"{method_name:12s} {mode:20s} "
                 f"{pooled['near_fpr95']:8.2f} {pooled['far_fpr95']:8.2f} {pooled['mean_fpr95']:8.2f}"
             )
 
@@ -3056,12 +3181,8 @@ def _planned_classes(args: argparse.Namespace) -> list[str]:
         )
     except (FileNotFoundError, IsADirectoryError, OSError):
         return list(PROFILE.label_classes)
-    per_class = bundle.get("per_class", bundle) if isinstance(bundle, dict) else {}
-    if not isinstance(per_class, dict) or not per_class:
-        return list(PROFILE.label_classes)
-    ordered = [c for c in PROFILE.label_classes if c in per_class]
-    ordered += [c for c in per_class if c not in ordered]
-    return ordered
+    ordered = training_data_classes(bundle) if isinstance(bundle, dict) else []
+    return ordered or list(PROFILE.label_classes)
 
 
 def print_skip_plan(args: argparse.Namespace) -> None:
@@ -3118,7 +3239,11 @@ def print_skip_plan(args: argparse.Namespace) -> None:
         else:
             score_plan = f"skip ({activations_path.name} exists)"
         print(f"    seed {seed}: heads {head_plan}; score {score_plan}", flush=True)
-    print("  C  FPR95 eval         run   (per seed; pooled mean±std, outlier=none)", flush=True)
+    modes = getattr(args, "id_val_outlier_modes", ["none", "spk_knn"])
+    print(
+        f"  C  FPR95 eval         run   (per seed; headline outlier=none; also {list(modes)})",
+        flush=True,
+    )
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -3162,6 +3287,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--extract-only", action="store_true",
                         help="Stop after stage B (ROI extraction); same as --stage A B")
+    parser.add_argument(
+        "--id-val-outlier-modes",
+        nargs="+",
+        choices=list(ID_VAL_OUTLIER_MODES),
+        default=["none", "spk_knn"],
+        help="Stage C ID-val calibration filters (default: none spk_knn). "
+             "spk_knn drops each class's highest 5%% kNN distances fit on standardized SPK4; "
+             "iforest drops lowest 5%% Isolation Forest scores. Headline tables use none.",
+    )
+    parser.add_argument(
+        "--id-val-outlier-knn-k",
+        type=int,
+        default=SPK_OUTLIER_KNN_K,
+        help="k for spk_knn outlier removal (default: 5; m-hood mean distance to k neighbors)",
+    )
     parser.add_argument("--skip-spk-variants", action="store_true",
                         help="Skip stage D (MDS/BAM/KNN/iForest on SPK features)")
     parser.add_argument("--bam-density", type=float, default=None,
