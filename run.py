@@ -40,6 +40,8 @@ Examples
     python run.py --root /content/spk --detector rtdetr --dataset bdd
     # checkpoint: /content/spk/model/frcnn/voc_vanilla.pth
     # outputs:    /content/spk/data/frcnn/voc/concept_head_ood/
+    # backups:    /content/drive/MyDrive/experiments/{detector}-{dataset}/
+    #             roi/  native_knn/  concept_head_ood/  gt_{dataset}.json
 """
 from __future__ import annotations
 
@@ -2334,6 +2336,139 @@ SEED = 42
 SEEDS = (42, 43, 44)
 CANONICAL_OUTLIER = "without_outlier_removal"
 LEGACY_HEAD_FILES = ("activations.csv", "results.json", "timing.json")
+EXPERIMENTS_DRIVE_DEFAULT = Path("/content/drive/MyDrive/experiments")
+
+
+def resolve_experiments_root(args: argparse.Namespace) -> Path | None:
+    """Return the Drive experiments root, or None when backup is disabled."""
+    if getattr(args, "no_backup", False):
+        return None
+    if args.experiments_dir is not None:
+        root = args.experiments_dir.expanduser().resolve()
+    elif EXPERIMENTS_DRIVE_DEFAULT.is_dir():
+        root = EXPERIMENTS_DRIVE_DEFAULT
+    else:
+        return None
+    if not root.is_dir():
+        print(f"  backup skipped: {root} is not a directory", flush=True)
+        return None
+    return root
+
+
+def experiment_subdir(experiments_root: Path) -> Path:
+    """experiments/{detector}-{dataset}/ — same layout as mount_data.sh expects."""
+    return experiments_root / f"{PROFILE.detector}-{PROFILE.name}"
+
+
+def _human_bytes(n: int) -> str:
+    size = float(max(n, 0))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024.0 or unit == "TB":
+            if unit == "B":
+                return f"{int(size)}{unit}"
+            return f"{size:.1f}{unit}"
+        size /= 1024.0
+    return f"{size:.1f}TB"
+
+
+def _sync_into(src: Path, dest: Path) -> tuple[int, int]:
+    """Copy file or directory *contents* into dest (never dest/src.name nesting)."""
+    if not src.exists():
+        return 0, 0
+    dest.mkdir(parents=True, exist_ok=True)
+    copied, nbytes = 0, 0
+    paths = [src] if src.is_file() else sorted(p for p in src.rglob("*") if p.is_file())
+    for path in paths:
+        rel = path.name if src.is_file() else path.relative_to(src)
+        out = dest / rel
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if out.is_file():
+            src_stat, dst_stat = path.stat(), out.stat()
+            if src_stat.st_size == dst_stat.st_size and src_stat.st_mtime <= dst_stat.st_mtime:
+                continue
+        shutil.copy2(path, out)
+        copied += 1
+        nbytes += path.stat().st_size
+    return copied, nbytes
+
+
+def _backup_stage(experiments_root: Path, label: str, src: Path, dest_name: str) -> None:
+    exp = experiment_subdir(experiments_root)
+    if not src.exists():
+        print(f"  backup {label}: skip (missing {src})", flush=True)
+        return
+    if src.is_file():
+        dest = exp / dest_name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.is_file():
+            src_stat, dst_stat = src.stat(), dest.stat()
+            if src_stat.st_size == dst_stat.st_size and src_stat.st_mtime <= dst_stat.st_mtime:
+                print(f"  backup {label}: up to date at {dest}", flush=True)
+                return
+        shutil.copy2(src, dest)
+        print(
+            f"  backup {label}: 1 file(s), {_human_bytes(src.stat().st_size)} -> {dest}",
+            flush=True,
+        )
+        return
+    dest = exp / dest_name
+    copied, nbytes = _sync_into(src, dest)
+    if copied:
+        print(
+            f"  backup {label}: {copied} file(s), {_human_bytes(nbytes)} -> {dest}",
+            flush=True,
+        )
+    else:
+        print(f"  backup {label}: up to date at {dest}", flush=True)
+
+
+def backup_gt_index(experiments_root: Path) -> None:
+    if GT_INDEX.is_file():
+        _backup_stage(experiments_root, "gt index", GT_INDEX, GT_INDEX.name)
+
+
+def backup_roi(experiments_root: Path) -> None:
+    _backup_stage(experiments_root, "roi", ROI_DIR, "roi")
+
+
+def backup_native_knn(experiments_root: Path) -> None:
+    if not NATIVE_ROOT.is_dir() or not any(NATIVE_ROOT.rglob("*")):
+        return
+    _backup_stage(experiments_root, "native_knn", NATIVE_ROOT, "native_knn")
+
+
+def backup_concept_head_ood(experiments_root: Path, out_root: Path, seeds: list[int]) -> None:
+    """Single seed -> flat concept_head_ood/ (yolo-voc on Drive); multi-seed keeps seed_*/."""
+    dest = experiment_subdir(experiments_root) / "concept_head_ood"
+    dest.mkdir(parents=True, exist_ok=True)
+    copied, nbytes = 0, 0
+    if len(seeds) == 1:
+        seed_src = seed_dir(out_root, seeds[0])
+        if seed_src.is_dir():
+            n, b = _sync_into(seed_src, dest)
+            copied += n
+            nbytes += b
+        for name in ("timing.json", "pooled_mean_std.json"):
+            src = out_root / name
+            if not src.is_file():
+                continue
+            out = dest / name
+            if out.is_file():
+                src_stat, dst_stat = src.stat(), out.stat()
+                if src_stat.st_size == dst_stat.st_size and src_stat.st_mtime <= dst_stat.st_mtime:
+                    continue
+            shutil.copy2(src, out)
+            copied += 1
+            nbytes += src.stat().st_size
+    else:
+        copied, nbytes = _sync_into(out_root, dest)
+    if copied:
+        print(
+            f"  backup concept_head_ood: {copied} file(s), {_human_bytes(nbytes)} -> {dest}",
+            flush=True,
+        )
+    elif out_root.is_dir() and any(out_root.rglob("*")):
+        print(f"  backup concept_head_ood: up to date at {dest}", flush=True)
 
 
 def seed_dir(root: Path, seed: int) -> Path:
@@ -2708,6 +2843,18 @@ def parse_args() -> argparse.Namespace:
                         help="Single concept-head seed (default: 42)")
     parser.add_argument("--seeds", nargs="+", type=int, default=None,
                         help="Run several concept-head seeds (e.g. --seeds 42 43 44)")
+    parser.add_argument(
+        "--experiments-dir",
+        type=Path,
+        default=None,
+        help="Drive experiments root for stage backups "
+             "(default: /content/drive/MyDrive/experiments when mounted)",
+    )
+    parser.add_argument(
+        "--no-backup",
+        action="store_true",
+        help="Do not copy stage outputs to experiments/{detector}-{dataset}/",
+    )
     args = parser.parse_args()
     set_profile(args.detector, args.dataset)
     if args.root is not None:
@@ -2759,6 +2906,14 @@ def main() -> None:
         f"vram_frac={args.vram_frac:.0%}  seeds={list(args.seeds)}",
         flush=True,
     )
+    experiments_root = resolve_experiments_root(args)
+    if experiments_root is not None:
+        print(f"  experiments backup -> {experiment_subdir(experiments_root)}/", flush=True)
+    else:
+        print(
+            "  experiments backup disabled (use --experiments-dir or mount Drive; --no-backup to silence)",
+            flush=True,
+        )
     print_skip_plan(args)
     t_all = time.perf_counter()
     timings: dict[str, float] = {}
@@ -2773,6 +2928,8 @@ def main() -> None:
         build_gt_index(DATASET_DIR, GT_INDEX)
     timings["A_gt_index"] = time.perf_counter() - t0
     print(f"  stage A wall {_fmt_duration(timings['A_gt_index'])}")
+    if experiments_root is not None:
+        backup_gt_index(experiments_root)
 
     print("=== [B] ROI extraction ===")
     t0 = time.perf_counter()
@@ -2789,6 +2946,9 @@ def main() -> None:
     summary_path = write_extraction_summary(summaries, timings["B_roi_extract"])
     print(f"  wrote {summary_path}")
     print(f"  stage B wall {_fmt_duration(timings['B_roi_extract'])}")
+    if experiments_root is not None:
+        backup_roi(experiments_root)
+        backup_native_knn(experiments_root)
 
     if args.extract_only:
         timings["total"] = time.perf_counter() - t_all
@@ -2830,6 +2990,9 @@ def main() -> None:
     timing_path = args.out_root / "timing.json"
     timing_path.write_text(json.dumps(timings, indent=2) + "\n")
     print(f"wrote {timing_path}")
+    if experiments_root is not None:
+        backup_concept_head_ood(experiments_root, args.out_root, list(args.seeds))
+        backup_native_knn(experiments_root)
 
 
 if __name__ == "__main__":
