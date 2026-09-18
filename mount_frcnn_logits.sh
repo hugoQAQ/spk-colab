@@ -173,6 +173,15 @@ fi
 if [ -z "$fx_src" ]; then
   echo "MISSING frcnn_fx (need Drive shared/models/faster_rcnn/fx, /content/frcnn_fx, or $HERE/frcnn_fx)"
   missing=$((missing + 1))
+elif [ "$fx_src" = "$HERE/frcnn_fx" ] && [ ! -e "$MODEL_DIR/frcnn_fx" ]; then
+  echo
+  echo "==> frcnn_fx/ (bundled) -> symlink $MODEL_DIR/frcnn_fx"
+  ln -sfn "$fx_src" "$MODEL_DIR/frcnn_fx"
+  echo "ok frcnn_fx/ (symlink)"
+  copied=$((copied + 1))
+elif [ "$fx_src" = "$HERE/frcnn_fx" ] && [ -L "$MODEL_DIR/frcnn_fx" ]; then
+  echo "ok frcnn_fx/ (existing symlink)"
+  copied=$((copied + 1))
 else
   copy_tree "$fx_src" "$MODEL_DIR/frcnn_fx"
 fi

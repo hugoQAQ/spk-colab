@@ -21,7 +21,9 @@ Also includes flat concatenation across classes:
 
 Examples
 --------
-    # VOC
+    # Colab: clone repo (frcnn_fx ships in-repo), mount weights + image tars, then extract
+    git clone <repo-url> /content/spk-colab
+    cd /content/spk-colab
     bash mount_frcnn_logits.sh
     python frcnn_logits_extraction.py --dataset voc --root /content/spk
 
@@ -33,7 +35,6 @@ Examples
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import tarfile
 import time
@@ -46,6 +47,10 @@ import cv2
 import numpy as np
 import torch
 from tqdm.auto import tqdm
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
 
 # Match run.py detector settings.
 CONF = 0.25
@@ -83,7 +88,6 @@ BACKGROUND_NAME = "background"
 class DatasetConfig:
     name: str
     checkpoint: str
-    frcnn_config: str
     detector_class_names: tuple[str, ...]
     split_specs: dict[str, dict[str, str]]
     label_aliases: dict[str, str] = field(default_factory=dict)
@@ -94,7 +98,6 @@ DATASETS: dict[str, DatasetConfig] = {
     "voc": DatasetConfig(
         name="voc",
         checkpoint="voc_vanilla.pth",
-        frcnn_config="model/frcnn/frcnn_fx/FX_vanilla_voc.yaml",
         detector_class_names=FRCNN_VOC20,
         split_specs={
             "voc-train": {"prefix": "voc_yolo_train", "search": "id"},
@@ -115,7 +118,6 @@ DATASETS: dict[str, DatasetConfig] = {
     "bdd": DatasetConfig(
         name="bdd",
         checkpoint="bdd_vanilla.pth",
-        frcnn_config="model/frcnn/frcnn_fx/FX_vanilla_bdd.yaml",
         detector_class_names=FRCNN_BDD10,
         split_specs={
             "bdd-train": {"prefix": "bdd_train_10k", "search": "id"},
@@ -216,22 +218,6 @@ def canonical_class(raw_label: str, aliases: dict[str, str]) -> str:
     return aliases.get(lowered, aliases.get(text, text))
 
 
-def _fx_split_predictions(predictions, proposals):
-    """Pass through per-image tuples from Detectron2 box/score heads (FX patch)."""
-    sizes = [len(p) for p in proposals]
-    if isinstance(predictions, (list, tuple)):
-        if len(predictions) == len(proposals):
-            return list(predictions)
-        if len(predictions) == 1:
-            predictions = predictions[0]
-        else:
-            raise ValueError(
-                f"cannot split prediction collection of length {len(predictions)} "
-                f"across {len(proposals)} images"
-            )
-    return list(predictions.split(sizes, dim=0))
-
-
 class FRCNNLogitsExtractor:
     """Detectron2 FX Faster R-CNN with pre-softmax class logits per detection."""
 
@@ -259,19 +245,14 @@ class FRCNNLogitsExtractor:
 
         if not cfg_path.is_file():
             raise FileNotFoundError(
-                f"{cfg_path} (copy frcnn_fx/ via mount_frcnn_logits.sh or upload next to this script)"
+                f"{cfg_path} (bundled frcnn_fx/ should ship with this repo; "
+                "mount_frcnn_logits.sh also copies it under model/frcnn/frcnn_fx/)"
             )
         fx_dir = cfg_path.parent
         if str(fx_dir) not in sys.path:
             sys.path.insert(0, str(fx_dir))
-        import utils.background as fx_bg  # noqa: E402
-        import utils.fxrcnn as fx_mod  # noqa: F401,E402
+        import utils.fxrcnn  # noqa: F401,E402  registers FXGeneralizedRCNN
 
-        fx_bg.split_predictions = _fx_split_predictions
-        fx_mod.split_predictions = _fx_split_predictions
-
-        old_cwd = os.getcwd()
-        os.chdir(str(fx_dir))
         cfg = get_cfg()
         cfg.merge_from_file(str(cfg_path))
         cfg.MODEL.WEIGHTS = str(checkpoint.resolve())
@@ -285,7 +266,6 @@ class FRCNNLogitsExtractor:
         self.model.eval()
         DetectionCheckpointer(self.model).load(cfg.MODEL.WEIGHTS)
         self.model.to(self.device)
-        os.chdir(old_cwd)
         for param in self.model.parameters():
             param.requires_grad = False
 
@@ -297,36 +277,24 @@ class FRCNNLogitsExtractor:
 
     @torch.inference_mode()
     def _infer_one_bgr(self, image_bgr: np.ndarray) -> list[dict[str, Any]]:
-        image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        orig_h, orig_w = image.shape[:2]
-        tensor = torch.as_tensor(image.transpose(2, 0, 1), device=self.device)
+        orig_h, orig_w = image_bgr.shape[:2]
+        tensor = torch.as_tensor(image_bgr.transpose(2, 0, 1).copy(), device=self.device)
         batched = [{"image": tensor, "height": orig_h, "width": orig_w}]
 
-        images = self.model.preprocess_image(batched)
-        features = self.model.backbone(images.tensor)
-        proposals, _ = self.model.proposal_generator(images, features, None)
-
-        proposal_boxes = [x.proposal_boxes for x in proposals]
-        box_features = self.model.roi_heads.box_pooler(
-            [features[f] for f in self.model.roi_heads.box_in_features],
-            proposal_boxes,
-        )
-        box_features = self.model.roi_heads.box_head(box_features)
-        pred_class_logits, pred_proposal_deltas = self.model.roi_heads.box_predictor(box_features)
-        predictions = (pred_class_logits, pred_proposal_deltas)
-        pred_instances, kept_indices = self.model.roi_heads.box_predictor.inference(
-            predictions, proposals
-        )
-        pred_instances = self.model._postprocess(pred_instances, batched, images.image_sizes)
-
-        inst = pred_instances[0]
-        kept = kept_indices[0]
+        outputs = self.model(batched)
+        inst = outputs[0]["instances"]
         if inst is None or len(inst) == 0:
             return []
+        if not hasattr(inst, "pred_logits"):
+            raise RuntimeError(
+                "FXGeneralizedRCNN did not attach pred_logits; "
+                "ensure bundled spk-colab/frcnn_fx is on sys.path"
+            )
 
         boxes = inst.pred_boxes.tensor.detach().cpu()
         scores = inst.scores.detach().cpu()
         pred_classes = inst.pred_classes.detach().cpu()
+        pred_logits = inst.pred_logits.detach().cpu()
 
         detections: list[dict[str, Any]] = []
         for i in range(len(inst)):
@@ -334,15 +302,13 @@ class FRCNNLogitsExtractor:
             pred_class = self._class_name(fg_idx)
             if self.eval_classes is not None and pred_class not in self.eval_classes:
                 continue
-            row_idx = int(kept[i].item())
-            logits = pred_class_logits[row_idx].detach().cpu().float()
             detections.append({
                 "bbox_xyxy": boxes[i],
                 "confidence": float(scores[i].item()),
                 "pred_label": fg_idx,
                 "pred_class": pred_class,
                 "detector_label": self.foreground_names[fg_idx],
-                "logits": logits,
+                "logits": pred_logits[i].float(),
             })
         detections.sort(key=lambda d: d["confidence"], reverse=True)
         return detections[:MAX_DET]
@@ -502,8 +468,10 @@ def main() -> None:
             f"(choose from {list(dataset.split_specs)})"
         )
 
+    from frcnn_fx.bootstrap import config_path as frcnn_config_path
+
     checkpoint = args.root / "model/frcnn" / dataset.checkpoint
-    cfg_path = args.root / dataset.frcnn_config
+    cfg_path = frcnn_config_path(args.root, dataset.name)
     if not checkpoint.is_file():
         raise FileNotFoundError(checkpoint)
     out_dir = args.out or (args.root / "data/frcnn" / dataset.name / "logits")
