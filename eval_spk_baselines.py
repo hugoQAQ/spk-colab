@@ -30,8 +30,7 @@ SPK4 = ["known_max", "unknown", "proxy_max", "relative_area"]
 SPK_FULL = SPK4 + ["native_knn"]
 SPK_METHODS = ["MDS", "BAM", "KNN", "iForest"]
 DISPLAY_NAME = {"MDS": "SPK MDS", "BAM": "SPK BAM", "KNN": "SPK KNN", "iForest": "SPK IF"}
-SEEDS = (42,)
-DEFAULT_ROOT = Path("/content/spk")
+DEFAULT_BAM_DENSITY_SWEEP = (1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0)
 
 SPLIT_MAP = {
     "id_train": "train",
@@ -214,6 +213,149 @@ def seed_jobs(args: argparse.Namespace) -> list[tuple[int, Path]]:
     return [(int(seed), args.activations) for seed in args.seeds]
 
 
+def make_baseline_args(args: argparse.Namespace, seed: int, bam_density: float | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        mds_labels="predicted",
+        covariance=args.covariance,
+        knn_mode=args.knn_mode,
+        knn_k=args.knn_k,
+        bam_density=args.bam_density if bam_density is None else bam_density,
+        bam_max_boxes=args.bam_max_boxes,
+        bam_cluster=args.bam_cluster,
+        iforest_scope="classwise",
+        trees=200,
+        iforest_samples=512,
+        seed=seed,
+        jobs=args.jobs,
+        batch_size=args.batch_size,
+        scale_percentile=65.0,
+        scale_degenerate="error",
+        msp_denominator="all",
+        msp_activation="softmax",
+        temperature=1.0,
+    )
+
+
+def eval_bam_seed(
+    data: dict,
+    train_x: np.ndarray,
+    train_y: np.ndarray,
+    baseline_args: SimpleNamespace,
+) -> dict[str, dict[str, float | None]]:
+    eval_names = [k for k in data if k != "train"]
+    ood_splits = [k for k in eval_names if k != "id_val"]
+    model = ood_baseline.fit_model("BAM", train_x, train_y, baseline_args)
+    scores = {}
+    for split in eval_names:
+        scores[split], _ = ood_baseline.score("BAM", model, data[split], baseline_args)
+    metrics = {}
+    for split in ood_splits:
+        metrics[split] = ood_baseline.metrics(scores["id_val"], scores[split])
+    return metrics
+
+
+def run_bam_density_sweep(args: argparse.Namespace) -> int:
+    jobs = seed_jobs(args)
+    sweep_dir = args.out / "bam_density_sweep"
+    sweep_dir.mkdir(parents=True, exist_ok=True)
+    densities = list(args.sweep_bam_density)
+    rows: list[dict] = []
+
+    print(
+        f"\n=== BAM density sweep ({len(args.features)}D) -> {sweep_dir} ===",
+        flush=True,
+    )
+    print(f"densities={densities}  jobs={len(jobs)}", flush=True)
+
+    for seed, activations_path in jobs:
+        data, _ = load_spk_splits(args, activations_path)
+        train_x = data["train"]["x"]
+        train_y = data["train"]["labels"]
+        if args.max_train_per_class:
+            ix = ood_baseline.train_indices(train_y, args.max_train_per_class, seed)
+            train_x, train_y = train_x[ix], train_y[ix]
+        print(f"\n--- seed {seed} train={len(train_x):,} ---", flush=True)
+
+        for density in densities:
+            baseline_args = make_baseline_args(args, seed, bam_density=float(density))
+            started = time.perf_counter()
+            try:
+                metrics = eval_bam_seed(data, train_x, train_y, baseline_args)
+                wall = time.perf_counter() - started
+                near = metrics["near_ood"]
+                far = metrics["far_ood"]
+                mean_fpr = float(np.mean([near["fpr95_pct"], far["fpr95_pct"]]))
+                row = {
+                    "seed": seed,
+                    "bam_density": float(density),
+                    "near_fpr95_pct": near["fpr95_pct"],
+                    "far_fpr95_pct": far["fpr95_pct"],
+                    "mean_fpr95_pct": mean_fpr,
+                    "near_auroc_pct": near["auroc_pct"],
+                    "far_auroc_pct": far["auroc_pct"],
+                    "wall_seconds": wall,
+                }
+                rows.append(row)
+                print(
+                    f"  density={density:5.1f}  near={near['fpr95_pct']:6.2f}  "
+                    f"far={far['fpr95_pct']:6.2f}  mean={mean_fpr:6.2f}  "
+                    f"({wall:.2f}s)",
+                    flush=True,
+                )
+            except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
+                print(f"  density={density:5.1f}  FAILED: {exc}", flush=True)
+
+    if not rows:
+        raise SystemExit("BAM density sweep produced no successful runs")
+
+    sweep_csv = sweep_dir / "sweep.csv"
+    with open(sweep_csv, "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    by_density: dict[float, list[dict]] = {}
+    for row in rows:
+        by_density.setdefault(float(row["bam_density"]), []).append(row)
+
+    pooled = []
+    print(f"\n=== pooled over {len(jobs)} seed(s) ===", flush=True)
+    print(f"{'density':8s} {'near FPR95':14s} {'far FPR95':14s} {'mean FPR95':14s}", flush=True)
+    for density in densities:
+        part = by_density.get(float(density), [])
+        if not part:
+            continue
+        near_vals = [float(r["near_fpr95_pct"]) for r in part if r["near_fpr95_pct"] is not None]
+        far_vals = [float(r["far_fpr95_pct"]) for r in part if r["far_fpr95_pct"] is not None]
+        mean_vals = [float(r["mean_fpr95_pct"]) for r in part if r["mean_fpr95_pct"] is not None]
+        pooled.append({
+            "bam_density": float(density),
+            "near_fpr95": _fmt_mean_std(near_vals).strip(),
+            "far_fpr95": _fmt_mean_std(far_vals).strip(),
+            "mean_fpr95": _fmt_mean_std(mean_vals).strip(),
+        })
+        print(
+            f"{density:8.1f} {_fmt_mean_std(near_vals):14s} "
+            f"{_fmt_mean_std(far_vals):14s} {_fmt_mean_std(mean_vals):14s}",
+            flush=True,
+        )
+
+    best = min(
+        pooled,
+        key=lambda row: float(row["mean_fpr95"].split()[0])
+        if row["mean_fpr95"] != "nan"
+        else float("inf"),
+    )
+    (sweep_dir / "pooled_mean_std.json").write_text(json.dumps(pooled, indent=2) + "\n")
+    print(
+        f"\nbest mean FPR95: density={best['bam_density']}  "
+        f"near={best['near_fpr95']}  far={best['far_fpr95']}  mean={best['mean_fpr95']}",
+        flush=True,
+    )
+    print(f"wrote {sweep_csv}", flush=True)
+    return 0
+
+
 def run_eval(args: argparse.Namespace) -> int:
     jobs = seed_jobs(args)
     args.out.mkdir(parents=True, exist_ok=True)
@@ -244,26 +386,7 @@ def run_eval(args: argparse.Namespace) -> int:
                 ood_splits_seen.append(split)
             for method in args.methods:
                 by_method[method_label(method)].setdefault(split, {"fpr95_pct": [], "auroc_pct": []})
-        baseline_args = SimpleNamespace(
-            mds_labels="predicted",
-            covariance=args.covariance,
-            knn_mode=args.knn_mode,
-            knn_k=args.knn_k,
-            bam_density=args.bam_density,
-            bam_max_boxes=args.bam_max_boxes,
-            bam_cluster=args.bam_cluster,
-            iforest_scope="classwise",
-            trees=200,
-            iforest_samples=512,
-            seed=seed,
-            jobs=args.jobs,
-            batch_size=args.batch_size,
-            scale_percentile=65.0,
-            scale_degenerate="error",
-            msp_denominator="all",
-            msp_activation="softmax",
-            temperature=1.0,
-        )
+        baseline_args = make_baseline_args(args, seed)
         train_x = data["train"]["x"]
         train_y = data["train"]["labels"]
         if args.max_train_per_class:
@@ -356,7 +479,16 @@ def main() -> int:
     parser.add_argument("--methods", nargs="+", choices=["BAM", "KNN", "MDS", "iForest"],
                         default=SPK_METHODS)
     parser.add_argument("--train-tp-only", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--bam-density", type=float, default=5.0)
+    parser.add_argument("--bam-density", type=float, default=5.0,
+                        help="BAM boxes per class ~ train_rows / density (m-hood: VOC=5, BDD=50)")
+    parser.add_argument(
+        "--sweep-bam-density",
+        nargs="*",
+        type=float,
+        default=None,
+        metavar="D",
+        help="Sweep BAM only over these densities (default grid: 1 2 3 5 10 20 50)",
+    )
     parser.add_argument("--bam-max-boxes", type=int, default=256)
     parser.add_argument("--bam-cluster", choices=["minibatch", "kmeans"], default="minibatch")
     parser.add_argument("--knn-mode", choices=["mhood", "sun"], default="mhood")
@@ -373,6 +505,9 @@ def main() -> int:
         args.seeds = [args.seed]
     resolve_bundle(args)
     with threadpool_limits(limits=args.jobs):
+        if args.sweep_bam_density is not None:
+            args.sweep_bam_density = args.sweep_bam_density or list(DEFAULT_BAM_DENSITY_SWEEP)
+            return run_bam_density_sweep(args)
         return run_eval(args)
 
 
