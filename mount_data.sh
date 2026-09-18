@@ -8,7 +8,7 @@
 #
 # Layout under DEST=/content/spk:
 #   model/{yolo,frcnn,rtdetr}/{voc,bdd}_vanilla.{pt,pth}
-#   data/id , data/ood                          (shared image tars; gt_{dataset}.json is built by run.py)
+#   data/id , data/ood                          (shared image tars + gt_{dataset}.json)
 #   data/{detector}/{dataset}/training_data.pt
 #   data/{detector}/{dataset}/{roi,native_knn,concept_head_ood}/
 #     copied from Drive experiments/{detector}-{dataset}/ when present so
@@ -27,6 +27,7 @@
 #   shared/models/rtdetr/{voc,bdd}_vanilla.pt
 #   shared/models/faster_rcnn/{voc,bdd}_vanilla.pth
 #   shared/datasets/id/{voc,bdd}/...  (bdd train default: bdd_train_10k-*.tar)
+#   shared/datasets/id/voc/gt_voc.json  (for eval-only SPK baselines; also gt_bdd.json)
 #   shared/datasets/ood/{near-ood-voc,near-ood-bdd,far-ood}/...
 #   semantic_training_data/{detector}-{dataset}.pt  (also accepts {detector}_{dataset}.pt)
 # Optional on Drive (under MyDrive/experiments/{detector}-{dataset}/):

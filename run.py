@@ -42,6 +42,8 @@ Examples
     # outputs:    /content/spk/data/frcnn/voc/concept_head_ood/
     # backups:    /content/drive/MyDrive/experiments/{detector}-{dataset}/
     #             roi/  native_knn/  concept_head_ood/  gt_{dataset}.json
+    # assets:     /content/drive/MyDrive/assets/shared/datasets/id/{dataset}/gt_{dataset}.json
+    #             (uploaded once when missing, for mount_data.sh --eval-only)
 """
 from __future__ import annotations
 
@@ -2402,6 +2404,7 @@ SEEDS = (42, 43, 44)
 CANONICAL_OUTLIER = "without_outlier_removal"
 LEGACY_HEAD_FILES = ("activations.csv", "results.json", "timing.json")
 EXPERIMENTS_DRIVE_DEFAULT = Path("/content/drive/MyDrive/experiments")
+ASSETS_SHARED_DRIVE_DEFAULT = Path("/content/drive/MyDrive/assets/shared")
 
 
 def resolve_experiments_root(args: argparse.Namespace) -> Path | None:
@@ -2418,6 +2421,27 @@ def resolve_experiments_root(args: argparse.Namespace) -> Path | None:
         print(f"  backup skipped: {root} is not a directory", flush=True)
         return None
     return root
+
+
+def resolve_assets_shared_root(args: argparse.Namespace) -> Path | None:
+    """Return Drive assets/shared root, or None when Drive publish is disabled."""
+    if getattr(args, "no_backup", False):
+        return None
+    if args.assets_dir is not None:
+        root = args.assets_dir.expanduser().resolve()
+    elif ASSETS_SHARED_DRIVE_DEFAULT.is_dir():
+        root = ASSETS_SHARED_DRIVE_DEFAULT
+    else:
+        return None
+    if not root.is_dir():
+        print(f"  assets publish skipped: {root} is not a directory", flush=True)
+        return None
+    return root
+
+
+def assets_gt_index_dest(assets_shared_root: Path) -> Path:
+    """Same path mount_data.sh reads for eval-only SPK baselines."""
+    return assets_shared_root / "datasets" / "id" / PROFILE.name / f"gt_{PROFILE.name}.json"
 
 
 def experiment_subdir(experiments_root: Path) -> Path:
@@ -2490,6 +2514,23 @@ def _backup_stage(experiments_root: Path, label: str, src: Path, dest_name: str)
 def backup_gt_index(experiments_root: Path) -> None:
     if GT_INDEX.is_file():
         _backup_stage(experiments_root, "gt index", GT_INDEX, GT_INDEX.name)
+
+
+def publish_gt_index_to_assets(assets_shared_root: Path) -> None:
+    """Upload gt_{dataset}.json to Drive assets when missing (for mount_data.sh --eval-only)."""
+    if not GT_INDEX.is_file():
+        print(f"  assets gt index: skip (missing {GT_INDEX})", flush=True)
+        return
+    dest = assets_gt_index_dest(assets_shared_root)
+    if dest.is_file():
+        print(f"  assets gt index: already at {dest}", flush=True)
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(GT_INDEX, dest)
+    print(
+        f"  assets gt index: uploaded {_human_bytes(dest.stat().st_size)} -> {dest}",
+        flush=True,
+    )
 
 
 def backup_roi(experiments_root: Path) -> None:
@@ -2934,9 +2975,16 @@ def parse_args() -> argparse.Namespace:
              "(default: /content/drive/MyDrive/experiments when mounted)",
     )
     parser.add_argument(
+        "--assets-dir",
+        type=Path,
+        default=None,
+        help="Drive assets/shared root for gt_{dataset}.json publish "
+             "(default: /content/drive/MyDrive/assets/shared when mounted)",
+    )
+    parser.add_argument(
         "--no-backup",
         action="store_true",
-        help="Do not copy stage outputs to experiments/{detector}-{dataset}/",
+        help="Do not copy stage outputs to Drive (experiments/ or assets/shared/)",
     )
     args = parser.parse_args()
     set_profile(args.detector, args.dataset)
@@ -2990,11 +3038,19 @@ def main() -> None:
         flush=True,
     )
     experiments_root = resolve_experiments_root(args)
+    assets_shared_root = resolve_assets_shared_root(args)
     if experiments_root is not None:
         print(f"  experiments backup -> {experiment_subdir(experiments_root)}/", flush=True)
     else:
         print(
             "  experiments backup disabled (use --experiments-dir or mount Drive; --no-backup to silence)",
+            flush=True,
+        )
+    if assets_shared_root is not None:
+        print(f"  assets gt index -> {assets_gt_index_dest(assets_shared_root)}", flush=True)
+    else:
+        print(
+            "  assets gt publish disabled (use --assets-dir or mount Drive; --no-backup to silence)",
             flush=True,
         )
     print_skip_plan(args)
@@ -3013,6 +3069,8 @@ def main() -> None:
     print(f"  stage A wall {_fmt_duration(timings['A_gt_index'])}")
     if experiments_root is not None:
         backup_gt_index(experiments_root)
+    if assets_shared_root is not None:
+        publish_gt_index_to_assets(assets_shared_root)
 
     print("=== [B] ROI extraction ===")
     t0 = time.perf_counter()
