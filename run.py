@@ -234,6 +234,7 @@ RTDETR_VOC_PROFILE = replace(
     detector="rtdetr",
     checkpoint="voc_vanilla.pt",
     roi_cache_type="rtdetr_voc_fp8_roi_features",
+    feature_channels=768,
     roi_feature_definition="RT-DETR hybrid-encoder multi-scale ROIAlign; NMS-free top-30",
     native_feature_definition="RT-DETR encoder feature-map global mean+std pooling",
 )
@@ -243,6 +244,7 @@ RTDETR_BDD_PROFILE = replace(
     detector="rtdetr",
     checkpoint="bdd_vanilla.pt",
     roi_cache_type="rtdetr_bdd_fp8_roi_features",
+    feature_channels=768,
     roi_feature_definition="RT-DETR hybrid-encoder multi-scale ROIAlign; NMS-free top-30",
     native_feature_definition="RT-DETR encoder feature-map global mean+std pooling",
 )
@@ -994,21 +996,26 @@ class RTDETRUnifiedForward:
         for param in self.model.parameters():
             param.requires_grad = False
         self._feat_buf: list[torch.Tensor] | None = None
-        hooked = False
-        for module in self.model.model:
-            name = module.__class__.__name__
-            if "Encoder" in name or name.startswith("Hybrid"):
-                module.register_forward_hook(self._encoder_hook)
-                hooked = True
-                break
-        if not hooked:
-            raise RuntimeError("RT-DETR HybridEncoder not found; cannot ROIAlign encoder features")
+        # Ultralytics RT-DETR has no HybridEncoder module: the YAML expands the
+        # hybrid encoder into AIFI + FPN/PAN RepC3 blocks, then RTDETRDecoder.
+        # Capture the decoder's multi-scale inputs (P3/P4/P5, typically 256-d).
+        decoder = next(
+            (m for m in self.model.modules() if m.__class__.__name__ == "RTDETRDecoder"),
+            None,
+        )
+        if decoder is None:
+            raise RuntimeError("RT-DETR RTDETRDecoder not found; cannot ROIAlign encoder features")
+        decoder.register_forward_pre_hook(self._decoder_pre_hook)
 
-    def _encoder_hook(self, _module, _inp, out) -> None:
-        if isinstance(out, (list, tuple)):
-            self._feat_buf = [t.detach() for t in out]
+    def _decoder_pre_hook(self, _module, inp) -> None:
+        feats = inp[0] if inp else None
+        if isinstance(feats, (list, tuple)):
+            maps = [t.detach() for t in feats if torch.is_tensor(t) and t.ndim == 4]
+        elif torch.is_tensor(feats) and feats.ndim == 4:
+            maps = [feats.detach()]
         else:
-            self._feat_buf = [out.detach()]
+            maps = []
+        self._feat_buf = maps if maps else None
 
     @staticmethod
     def _scale_fill_rgb(image_rgb: np.ndarray) -> tuple[torch.Tensor, dict[str, Any]]:
