@@ -1320,6 +1320,14 @@ class FRCNNUnifiedForward:
 
 
 def build_engine(device: str | torch.device):
+    if not CHECKPOINT.is_file():
+        raise FileNotFoundError(
+            f"{CHECKPOINT} (detector weights required to build ROI/native caches; "
+            f"reuse mounted data/{PROFILE.detector}/{PROFILE.name}/{{roi,native_knn}}/ "
+            "from mount_data.sh, or pass --stage C/D when those caches already exist)"
+        )
+    if PROFILE.detector == "frcnn" and not FRCNN_CFG.is_file():
+        raise FileNotFoundError(FRCNN_CFG)
     if PROFILE.detector == "frcnn":
         return FRCNNUnifiedForward(CHECKPOINT, device)
     if PROFILE.detector == "rtdetr":
@@ -1535,18 +1543,6 @@ def split_needs_extract(split: str, args: argparse.Namespace) -> tuple[bool, boo
     need_native = args.with_native and not native_ready(native_split_dir(split))
     need_prior = bool(args.with_prior)
     return need_roi, need_native, need_prior
-
-
-def needs_detector_checkpoint(args: argparse.Namespace, *, run_b: bool, run_c: bool) -> bool:
-    """True when a stage will run detector forward (ROI / native embeddings), not just reuse caches."""
-    if run_b:
-        for split in args.splits:
-            need_roi, need_native, need_prior = split_needs_extract(split, args)
-            if need_roi or need_prior or need_native:
-                return True
-    if run_c and any(not native_ready(native_split_dir(split)) for split in SPLITS):
-        return True
-    return False
 
 
 def save_roi_cache(
@@ -1922,7 +1918,13 @@ def build_class_data(bundle: dict, class_name: str):
         positive_set = set(positive)
         negative = [i for i in range(len(x_id)) if i not in positive_set]
         if not positive:
-            raise ValueError(f"{class_name}: no positive ID samples")
+            ch = int(x_id.shape[1]) if len(x_id) else int(unpack_features(unknown_block).shape[1])
+            return (
+                torch.empty(0, ch),
+                torch.empty(0, len(concept_order), 7, 7),
+                concept_order,
+                groups,
+            )
         id_selected = {
             "features": x_id[positive],
             "heatmaps": torch.ones((len(positive), 1, 7, 7)),
@@ -1936,6 +1938,15 @@ def build_class_data(bundle: dict, class_name: str):
             _append_supervision(xs, ys, fp_selected, unknown_slice, len(concept_order))
         _append_supervision(xs, ys, unknown_block, unknown_slice, len(concept_order), has_masks=False)
 
+    if not xs:
+        ref = id_block if block_num_samples(id_block) else unknown_block
+        ch = int(unpack_features(ref).shape[1]) if block_num_samples(ref) else 0
+        return (
+            torch.empty(0, ch),
+            torch.empty(0, len(concept_order), 7, 7),
+            concept_order,
+            groups,
+        )
     return torch.cat(xs), torch.cat(ys), concept_order, groups
 
 
@@ -3042,7 +3053,7 @@ def load_or_train_heads(args: argparse.Namespace) -> tuple[dict, list[str]]:
             _channel_mismatch_exit(td_ch, roi_ch)
         x, y, concept_order, groups = build_class_data(training_data, class_name)
         if len(x) == 0:
-            print(f"  [{class_name}] SKIPPED (no training ROIs in training_data.pt)", flush=True)
+            print(f"  [{class_name}] SKIPPED (no usable ID training ROIs)", flush=True)
             continue
         if roi_ch is not None and int(x.shape[1]) != roi_ch:
             _channel_mismatch_exit(int(x.shape[1]), roi_ch)
@@ -3111,10 +3122,6 @@ def load_or_score_activations(args: argparse.Namespace) -> tuple[pd.DataFrame, l
 
 def prepare_knn_activations(activations, class_names, args):
     """筛出训练集真阳性，并把图像级 kNN 距离附到每个检测框。"""
-    print("  ensuring image-level native embeddings")
-    ensure_native_embeddings(args)
-
-    id_train = activations[activations["data_source"] == "id_train"]
     id_train_tp = keep_true_positives(id_train, GT_INDEX)
     print(f"  ID-train true positives: {len(id_train_tp):,} of {len(id_train):,}", flush=True)
     if len(id_train) and len(id_train_tp) == 0:
@@ -3123,6 +3130,13 @@ def prepare_knn_activations(activations, class_names, args):
             "The GT index is almost certainly the wrong dataset (shared data/id/gt.json "
             "leftover). Delete it or let stage A rebuild data/id/gt_{dataset}.json."
         )
+
+    if KNN_COL in activations.columns and activations[KNN_COL].notna().any():
+        print(f"  reused {KNN_COL} from activations.csv (skip native embedding build)", flush=True)
+        return activations, id_train_tp
+
+    print("  ensuring image-level native embeddings", flush=True)
+    ensure_native_embeddings(args)
 
     if getattr(args, "_knn_tables", None) is None:
         args._knn_tables = build_native_knn_tables(id_train_tp, class_names)
@@ -3455,15 +3469,6 @@ def main() -> None:
         args.out_root.mkdir(parents=True, exist_ok=True)
         migrate_legacy_heads(args.out_root, args.seeds[0])
 
-    if needs_detector_checkpoint(args, run_b=run_b, run_c=run_c):
-        if not CHECKPOINT.is_file():
-            raise FileNotFoundError(
-                f"{CHECKPOINT} (needed for ROI/native extraction; "
-                "if caches are already mounted use --stage C or --stage D, "
-                "or run mount_data.sh to copy weights)"
-            )
-        if PROFILE.detector == "frcnn" and not FRCNN_CFG.is_file():
-            raise FileNotFoundError(FRCNN_CFG)
     if run_c and not resolve_training_data(TRAINING_DATA).is_file():
         raise FileNotFoundError(TRAINING_DATA)
 

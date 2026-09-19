@@ -318,19 +318,24 @@ fi
 echo
 reuse_stages=""
 if [ "$EVAL_ONLY" -eq 1 ]; then
-  src="$EXP_DIR/concept_head_ood"
-  if [ -d "$src" ]; then
-    src=$(unwrap_stage_src "$src" "concept_head_ood")
-    copy_tree "$src" "$ARCH_DIR/concept_head_ood"
-    reuse_stages="concept_head_ood"
-  elif [ -d "$ARCH_DIR/concept_head_ood" ]; then
-    echo "ok concept_head_ood (already at $ARCH_DIR/concept_head_ood)"
-    reuse_stages="concept_head_ood"
-    copied=$((copied + 1))
-  else
-    echo "MISSING $EXP_DIR/concept_head_ood (and no local $ARCH_DIR/concept_head_ood)"
-    missing=$((missing + 1))
-  fi
+  echo "eval-only: reuse roi/ native_knn/ concept_head_ood from experiments when present"
+  for stage in roi native_knn concept_head_ood; do
+    src="$EXP_DIR/$stage"
+    if [ -d "$src" ]; then
+      src=$(unwrap_stage_src "$src" "$stage")
+      copy_tree "$src" "$ARCH_DIR/$stage"
+      reuse_stages="${reuse_stages:+$reuse_stages, }$stage"
+    elif [ -d "$ARCH_DIR/$stage" ] && [ -n "$(find "$ARCH_DIR/$stage" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+      echo "ok $stage (already at $ARCH_DIR/$stage)"
+      reuse_stages="${reuse_stages:+$reuse_stages, }$stage"
+      copied=$((copied + 1))
+    elif [ "$stage" = concept_head_ood ]; then
+      echo "MISSING $EXP_DIR/concept_head_ood (and no local $ARCH_DIR/concept_head_ood)"
+      missing=$((missing + 1))
+    else
+      echo "skip $stage (not on Drive; stage C needs it for spk full unless activations.csv has native_knn)"
+    fi
+  done
 elif [ -d "$EXP_DIR" ]; then
   echo "reusing experiment caches from $EXP_DIR"
   for stage in roi native_knn concept_head_ood; do
