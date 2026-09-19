@@ -332,6 +332,21 @@ def resolve_training_data(path: Path) -> Path:
     raise FileNotFoundError(path)
 
 
+def stage_c_can_reuse_activations(args: argparse.Namespace) -> bool:
+    """True when stage C can eval from activations.csv without training_data.pt."""
+    if getattr(args, "retrain", False) or getattr(args, "rescore", False):
+        return False
+    seeds = list(getattr(args, "seeds", [getattr(args, "seed", SEED)]))
+    out_root = getattr(args, "out_root", args.out)
+    flat = out_root / "activations.csv"
+    for seed in seeds:
+        path = seed_dir(out_root, seed) / "activations.csv"
+        if path.is_file() or (len(seeds) == 1 and flat.is_file()):
+            continue
+        return False
+    return True
+
+
 # Canonical extraction settings (see README); not exposed as flags on purpose.
 # max_det is always 30 (YOLO NMS cap and FRCNN TEST.DETECTIONS_PER_IMAGE).
 CONF = 0.25
@@ -3122,6 +3137,7 @@ def load_or_score_activations(args: argparse.Namespace) -> tuple[pd.DataFrame, l
 
 def prepare_knn_activations(activations, class_names, args):
     """筛出训练集真阳性，并把图像级 kNN 距离附到每个检测框。"""
+    id_train = activations[activations["data_source"] == "id_train"]
     id_train_tp = keep_true_positives(id_train, GT_INDEX)
     print(f"  ID-train true positives: {len(id_train_tp):,} of {len(id_train):,}", flush=True)
     if len(id_train) and len(id_train_tp) == 0:
@@ -3469,8 +3485,17 @@ def main() -> None:
         args.out_root.mkdir(parents=True, exist_ok=True)
         migrate_legacy_heads(args.out_root, args.seeds[0])
 
-    if run_c and not resolve_training_data(TRAINING_DATA).is_file():
-        raise FileNotFoundError(TRAINING_DATA)
+    if run_c and not stage_c_can_reuse_activations(args):
+        try:
+            training = resolve_training_data(TRAINING_DATA)
+        except FileNotFoundError:
+            training = TRAINING_DATA
+        if not training.is_file():
+            raise FileNotFoundError(
+                f"{TRAINING_DATA} (needed to train/rescore concept heads; "
+                "eval-only reuse of activations.csv does not need this file — "
+                "copy yolo-voc.pt from Drive semantic_training_data/ or omit --rescore/--retrain)"
+            )
 
     args.extract_batch_resolved = int(args.extract_batch) if args.extract_batch > 0 else 0
     args._head_batch_cache = {}

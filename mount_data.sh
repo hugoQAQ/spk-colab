@@ -18,7 +18,7 @@
 #   DETECTOR=yolo DATASET=bdd bash mount_data.sh
 #   bash mount_data.sh --detector yolo --dataset bdd
 #   bash mount_data.sh --detector yolo --dataset bdd --eval-only
-#     copies concept_head_ood (+ gt json if found); skip images/weights
+#     copies concept_head_ood (+ optional native_knn, gt json); skip roi/images/weights
 # Then:
 #   python run.py --detector yolo --dataset bdd --stage D
 #
@@ -318,8 +318,8 @@ fi
 echo
 reuse_stages=""
 if [ "$EVAL_ONLY" -eq 1 ]; then
-  echo "eval-only: reuse roi/ native_knn/ concept_head_ood from experiments when present"
-  for stage in roi native_knn concept_head_ood; do
+  echo "eval-only: concept_head_ood required; native_knn optional (skip roi — not needed for stage D or rescore-from-csv)"
+  for stage in native_knn concept_head_ood; do
     src="$EXP_DIR/$stage"
     if [ -d "$src" ]; then
       src=$(unwrap_stage_src "$src" "$stage")
@@ -333,7 +333,7 @@ if [ "$EVAL_ONLY" -eq 1 ]; then
       echo "MISSING $EXP_DIR/concept_head_ood (and no local $ARCH_DIR/concept_head_ood)"
       missing=$((missing + 1))
     else
-      echo "skip $stage (not on Drive; stage C needs it for spk full unless activations.csv has native_knn)"
+      echo "skip $stage (not on Drive; ok if activations.csv already has native_knn)"
     fi
   done
 elif [ -d "$EXP_DIR" ]; then
