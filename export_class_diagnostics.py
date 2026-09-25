@@ -25,9 +25,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import cv2
 import matplotlib.pyplot as plt
@@ -40,7 +41,6 @@ from sklearn.preprocessing import StandardScaler
 import run as pipeline
 from run import (
     ConceptHead,
-    GT_INDEX,
     KNN_COL,
     ROI_DIR,
     ROI_SPLITS,
@@ -64,6 +64,83 @@ METHOD_SPECS: dict[str, tuple[str, list[str]]] = {
 }
 
 OOD_SPLITS = ("near_ood", "far_ood")
+
+# Colab layout: code under spk-colab/, tars + gt under spk/ (see mount_data.sh).
+_BUNDLE_ROOT_CANDIDATES = (
+    "SPK_ROOT",
+    "/content/spk",
+    "/content/spk-colab",
+)
+
+
+def gt_index_path(root: Path, dataset_name: str) -> Path:
+    return root / "data" / "id" / f"gt_{dataset_name}.json"
+
+
+def resolve_bundle_root(root: Path | None, dataset_name: str) -> Path:
+    """Pick bundle root containing data/id/gt_{dataset}.json (not the git checkout alone)."""
+    if root is not None:
+        chosen = root.expanduser().resolve()
+        gt = gt_index_path(chosen, dataset_name)
+        if not gt.is_file():
+            raise SystemExit(
+                f"--root {chosen} does not contain {gt.relative_to(chosen)}.\n"
+                f"Pass the spk bundle root (e.g. --root /content/spk), not the run.py repo directory."
+            )
+        return chosen
+
+    tried: list[str] = []
+    env_root = os.environ.get("SPK_ROOT", "").strip()
+    if env_root:
+        cand = Path(env_root).expanduser().resolve()
+        tried.append(str(cand))
+        gt = gt_index_path(cand, dataset_name)
+        if gt.is_file():
+            return cand
+
+    for raw in _BUNDLE_ROOT_CANDIDATES:
+        if raw == "SPK_ROOT":
+            continue
+        cand = Path(raw).expanduser().resolve()
+        if str(cand) in tried:
+            continue
+        tried.append(str(cand))
+        gt = gt_index_path(cand, dataset_name)
+        if gt.is_file():
+            print(f"  bundle root: {cand} (found {gt.name})", flush=True)
+            return cand
+
+    cwd = Path.cwd().resolve()
+    if str(cwd) not in tried:
+        gt = gt_index_path(cwd, dataset_name)
+        if gt.is_file():
+            print(f"  bundle root: {cwd}", flush=True)
+            return cwd
+
+    script_parent = pipeline.ROOT.resolve()
+    if str(script_parent) not in tried:
+        gt = gt_index_path(script_parent, dataset_name)
+        if gt.is_file():
+            return script_parent
+
+    hint = "\n  ".join(tried) or "(none)"
+    raise SystemExit(
+        f"could not find data/id/gt_{dataset_name}.json under any candidate root.\n"
+        f"Tried: {hint}\n"
+        f"Use: python export_class_diagnostics.py --root /content/spk ..."
+    )
+
+
+def resolve_gt_index(bundle_root: Path, dataset_name: str, override: Path | None) -> Path:
+    if override is not None:
+        path = override.expanduser().resolve()
+        if not path.is_file():
+            raise SystemExit(f"--gt-index not found: {path}")
+        return path
+    path = gt_index_path(bundle_root, dataset_name)
+    if not path.is_file():
+        raise SystemExit(f"missing GT index at {path}")
+    return path
 
 
 def _sanitize_name(text: str) -> str:
@@ -686,7 +763,18 @@ def save_example_images(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="Spk bundle root with data/ and model/ (default: $SPK_ROOT, /content/spk, or cwd)",
+    )
+    parser.add_argument(
+        "--gt-index",
+        type=Path,
+        default=None,
+        help="Override GT JSON (default: <root>/data/id/gt_{dataset}.json)",
+    )
     parser.add_argument("--detector", choices=("yolo", "frcnn", "rtdetr"), default="yolo")
     parser.add_argument("--dataset", choices=("voc", "bdd"), default="voc")
     parser.add_argument("--class-name", default=None, help="Single-class mode (omit with --all-failures)")
@@ -724,8 +812,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    set_root(args.root)
     set_profile(args.detector, args.dataset)
+    bundle_root = resolve_bundle_root(args.root, pipeline.PROFILE.name)
+    set_root(bundle_root)
+    gt_index = resolve_gt_index(bundle_root, pipeline.PROFILE.name, args.gt_index)
+    print(f"  gt index: {gt_index}", flush=True)
 
     if args.all_failures and args.class_name:
         raise SystemExit("use --all-failures without --class-name, or single-class mode without --all-failures")
@@ -741,10 +832,10 @@ def main() -> None:
 
     activations = pd.read_csv(activations_path)
     id_train = activations.loc[activations["data_source"] == "id_train"]
-    id_train_tp = keep_true_positives(id_train, GT_INDEX)
+    id_train_tp = keep_true_positives(id_train, gt_index)
 
     if args.all_failures:
-        out_dir = args.out_dir or (args.root / "diagnostics" / "ood_false_positives")
+        out_dir = args.out_dir or (bundle_root / "diagnostics" / "ood_false_positives")
         out_dir.mkdir(parents=True, exist_ok=True)
         class_names = sorted(activations["class"].astype(str).unique())
         print(f"=== export all OOD false positives ({len(class_names)} classes) ===", flush=True)
@@ -781,7 +872,7 @@ def main() -> None:
         return
 
     class_name = args.class_name
-    out_dir = args.out_dir or (args.root / "diagnostics" / class_name)
+    out_dir = args.out_dir or (bundle_root / "diagnostics" / class_name)
     out_dir.mkdir(parents=True, exist_ok=True)
     subset = activations.loc[activations["class"].astype(str) == class_name].copy()
     if subset.empty:
