@@ -45,7 +45,6 @@ from export_class_diagnostics import (
     try_fit_class_iforest,
 )
 from run import (
-    DATASET_DIR,
     IMAGE_SUFFIXES,
     KNN_COL,
     SPK4_COLS,
@@ -72,9 +71,10 @@ def load_id_val_ground_truth() -> dict[str, list[dict]]:
     """YOLO labels inside the ID-val tar (gt_*.json only indexes ID-train)."""
     split = val_tar_split()
     prefix = pipeline.PROFILE.split_tar_prefix[split]
-    paths = sorted(DATASET_DIR.glob(f"{prefix}-*.tar"))
+    dataset_dir = pipeline.DATASET_DIR
+    paths = sorted(dataset_dir.glob(f"{prefix}-*.tar"))
     if not paths:
-        raise SystemExit(f"no {prefix}-*.tar under {DATASET_DIR} (mount with --stage-c)")
+        raise SystemExit(f"no {prefix}-*.tar under {dataset_dir} (mount with --stage-c)")
 
     index: dict[str, list[dict]] = {}
     class_names = pipeline.PROFILE.label_classes
