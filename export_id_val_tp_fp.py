@@ -49,6 +49,18 @@ from run import KNN_COL, keep_true_positives, seed_dir, set_profile, set_root
 SCORE_COLS = ("known_max", "unknown", "proxy_max", "relative_area", "native_knn")
 
 
+def resolve_activations_csv(concept_root: Path, seed: int) -> Path:
+    """Stage C writes either seed_{seed}/activations.csv or a flat activations.csv."""
+    seeded = seed_dir(concept_root, seed) / "activations.csv"
+    flat = concept_root / "activations.csv"
+    if seeded.is_file():
+        return seeded
+    if flat.is_file():
+        print(f"  using {flat} (no {seeded.name} under seed_{seed}/)", flush=True)
+        return flat
+    raise SystemExit(f"missing {seeded}\nalso checked {flat}")
+
+
 def drive_experiments_dir(detector: str, dataset: str) -> Path | None:
     name = f"{detector}-{dataset}"
     for base in (
@@ -333,9 +345,7 @@ def main() -> None:
     bundle_root = resolve_bundle_root(args.root, pipeline.PROFILE.name)
     set_root(bundle_root)
 
-    activations_path = seed_dir(pipeline.ARCH_DIR / "concept_head_ood", args.seed) / "activations.csv"
-    if not activations_path.is_file():
-        raise SystemExit(f"missing {activations_path}")
+    activations_path = resolve_activations_csv(pipeline.ARCH_DIR / "concept_head_ood", args.seed)
     activations = pd.read_csv(activations_path)
     id_train = activations.loc[activations["data_source"] == "id_train"]
     id_train_tp = keep_true_positives(id_train, pipeline.GT_INDEX)
