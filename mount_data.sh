@@ -19,8 +19,12 @@
 #   bash mount_data.sh --detector yolo --dataset bdd
 #   bash mount_data.sh --detector yolo --dataset bdd --eval-only
 #     copies concept_head_ood (+ optional native_knn, gt json); skip roi/images/weights
+#   bash mount_data.sh --detector yolo --dataset voc --stage-c
+#     like eval-only but also copies ID/OOD image tars (for export_class_diagnostics /
+#     VocSplitImageSource); optional roi/ from experiments if present (concept attach)
 # Then:
 #   python run.py --detector yolo --dataset bdd --stage D
+#   python export_class_diagnostics.py --root $DEST --all-failures  (after --stage-c)
 #
 # Expects on Drive (under MyDrive/assets/):
 #   shared/models/yolo/{voc,bdd}_vanilla.pt
@@ -43,6 +47,7 @@
 DETECTOR="${DETECTOR:-yolo}"
 DATASET="${DATASET:-voc}"
 EVAL_ONLY=0
+STAGE_C=0
 ASSETS=/content/drive/MyDrive/assets
 SHARED="$ASSETS/shared"
 SEMANTIC="$ASSETS/semantic_training_data"
@@ -56,14 +61,18 @@ while [ $# -gt 0 ]; do
     --dataset) DATASET="$2"; shift 2 ;;
     --dest) DEST="$2"; shift 2 ;;
     --eval-only) EVAL_ONLY=1; shift ;;
+    --stage-c) STAGE_C=1; shift ;;
     -h|--help)
-      echo "Usage: $0 [--detector yolo|frcnn|rtdetr] [--dataset voc|bdd] [--eval-only] [--dest /content/spk]"
+      echo "Usage: $0 [--detector yolo|frcnn|rtdetr] [--dataset voc|bdd] [--dest /content/spk]"
+      echo "       [--eval-only | --stage-c]"
       echo "  or: DETECTOR=yolo DATASET=bdd $0"
-      echo "SPK eval after mount: python run.py --detector \$DETECTOR --dataset \$DATASET --stage D"
+      echo "  --eval-only  concept_head_ood + gt (+ native_knn); no image tars / weights / training_data"
+      echo "  --stage-c    same reuse as eval-only + ID/OOD image tars (for failure-case viz / export_class_diagnostics)"
+      echo "SPK eval: python run.py --detector \$DETECTOR --dataset \$DATASET --stage D"
       exit 0
       ;;
     *)
-      echo "unknown argument: $1 (use --detector --dataset --eval-only --dest)"
+      echo "unknown argument: $1 (use --detector --dataset --eval-only --stage-c --dest)"
       exit 2
       ;;
   esac
@@ -84,9 +93,26 @@ case "$DATASET" in
     ;;
 esac
 
+if [ "$EVAL_ONLY" -eq 1 ] && [ "$STAGE_C" -eq 1 ]; then
+  echo "use either --eval-only or --stage-c, not both"
+  exit 2
+fi
+
+# stage-c: eval-only caches + image tars (no detector weights / training_data.pt).
+if [ "$STAGE_C" -eq 1 ]; then
+  EVAL_ONLY=1
+fi
+
 EXP_DIR="$EXPERIMENTS/${DETECTOR}-${DATASET}"
 
-echo "DETECTOR=$DETECTOR  DATASET=$DATASET  DEST=$DEST  EVAL_ONLY=$EVAL_ONLY"
+MODE=full
+if [ "$STAGE_C" -eq 1 ]; then
+  MODE=stage-c
+elif [ "$EVAL_ONLY" -eq 1 ]; then
+  MODE=eval-only
+fi
+
+echo "DETECTOR=$DETECTOR  DATASET=$DATASET  DEST=$DEST  MODE=$MODE"
 echo "  model -> $DEST/model/$DETECTOR/"
 echo "  arch  -> $DEST/data/$DETECTOR/$DATASET/"
 echo "  exp   -> $EXP_DIR/{roi,native_knn,concept_head_ood}/  (optional reuse)"
@@ -292,13 +318,15 @@ copy_gt_index() {
   fi
 }
 
-if [ "$EVAL_ONLY" -eq 0 ]; then
+if [ "$EVAL_ONLY" -eq 0 ] || [ "$STAGE_C" -eq 1 ]; then
   if [ "$DATASET" = voc ]; then
     copy_voc_images
   else
     copy_bdd_images
   fi
+fi
 
+if [ "$EVAL_ONLY" -eq 0 ]; then
   if [ "$DETECTOR" = yolo ]; then
     copy "$SHARED/models/yolo/${DATASET}_vanilla.pt"             "$MODEL_DIR/"
   elif [ "$DETECTOR" = rtdetr ]; then
@@ -311,6 +339,8 @@ if [ "$EVAL_ONLY" -eq 0 ]; then
   copy_first "$ARCH_DIR/training_data.pt" \
     "$SEMANTIC/${DETECTOR}-${DATASET}.pt" \
     "$SEMANTIC/${DETECTOR}_${DATASET}.pt"
+elif [ "$STAGE_C" -eq 1 ]; then
+  echo "stage-c: copied image tars; skip detector weights and training_data.pt"
 else
   echo "eval-only: skip images, detector weights, and training_data.pt"
 fi
@@ -318,8 +348,16 @@ fi
 echo
 reuse_stages=""
 if [ "$EVAL_ONLY" -eq 1 ]; then
-  echo "eval-only: concept_head_ood required; native_knn optional (skip roi — not needed for stage D or rescore-from-csv)"
-  for stage in native_knn concept_head_ood; do
+  if [ "$STAGE_C" -eq 1 ]; then
+    echo "stage-c: concept_head_ood required; native_knn optional; roi optional (for export --attach-concepts)"
+  else
+    echo "eval-only: concept_head_ood required; native_knn optional (skip roi — not needed for stage D or rescore-from-csv)"
+  fi
+  stage_list="native_knn concept_head_ood"
+  if [ "$STAGE_C" -eq 1 ]; then
+    stage_list="roi native_knn concept_head_ood"
+  fi
+  for stage in $stage_list; do
     src="$EXP_DIR/$stage"
     if [ -d "$src" ]; then
       src=$(unwrap_stage_src "$src" "$stage")
@@ -332,6 +370,8 @@ if [ "$EVAL_ONLY" -eq 1 ]; then
     elif [ "$stage" = concept_head_ood ]; then
       echo "MISSING $EXP_DIR/concept_head_ood (and no local $ARCH_DIR/concept_head_ood)"
       missing=$((missing + 1))
+    elif [ "$stage" = roi ]; then
+      echo "skip $stage (not on Drive; ok unless export_class_diagnostics --attach-concepts)"
     else
       echo "skip $stage (not on Drive; ok if activations.csv already has native_knn)"
     fi
@@ -367,8 +407,17 @@ else
 fi
 echo "gt         -> $DEST/data/id/gt_${DATASET}.json"
 echo
-echo "SPK baselines eval (after MOUNT_DATA_OK):"
-echo "  python run.py --detector $DETECTOR --dataset $DATASET --stage D"
+if [ "$STAGE_C" -eq 1 ]; then
+  echo "stage C / failure export (after MOUNT_DATA_OK):"
+  echo "  python run.py --root $DEST --detector $DETECTOR --dataset $DATASET --stage C"
+  echo "  python export_class_diagnostics.py --root $DEST --detector $DETECTOR --dataset $DATASET --all-failures"
+elif [ "$EVAL_ONLY" -eq 1 ]; then
+  echo "SPK baselines eval (after MOUNT_DATA_OK):"
+  echo "  python run.py --root $DEST --detector $DETECTOR --dataset $DATASET --stage D"
+else
+  echo "full pipeline (after MOUNT_DATA_OK):"
+  echo "  python run.py --root $DEST --detector $DETECTOR --dataset $DATASET"
+fi
 echo
 du -sh "$DEST"
 echo "copied $copied file(s), missing=$missing"
